@@ -34,7 +34,7 @@ pub fn parse_args() -> Box<Args> {
         warmup_sec: 86400*3, 
         report_interval: 86400,
         bench_time: 86400000,
-        datapool_path: String::from(""),
+        datapool_path: String::from("/mnt/pmem1.0/junming/"),
         learn_interval: 86400, 
     });
 
@@ -78,5 +78,11 @@ pub fn parse_args() -> Box<Args> {
 
         ap.parse_args_or_exit();
     }
+    let path = &format!(
+        "{}hb3-seg-{}",
+        args.datapool_path,
+        chrono::Utc::now().format("%T")
+    );
+    args.datapool_path = path.to_string();
     args
 }

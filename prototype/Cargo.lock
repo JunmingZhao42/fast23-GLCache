@@ -99,6 +99,7 @@ version = "0.1.0"
 dependencies = [
  "argparse",
  "byteorder",
+ "chrono",
  "derivative",
  "l2cache",
  "lazy_static",

@@ -255,7 +255,7 @@ impl HashTable {
         // Allocate in Flash
         let total_buckets_flash = (buckets as f64 * (1.0 + overflow_factor)).ceil() as usize;
         let path = &format!(
-            "{}hashtable-{}",
+            "{}hb3-htbl-{}",
             PMEM_PATH,
             Utc::now().format("%T")
         );

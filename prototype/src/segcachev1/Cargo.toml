@@ -30,6 +30,7 @@ rand_xoshiro = { version = "0.6.0" }
 rustcommon-logger = { git = "https://github.com/1a1a11a/rustcommon"}
 rustcommon-time = { git = "https://github.com/1a1a11a/rustcommon"}
 thiserror = "1.0.24"
+chrono = "0.4.19"
 
 [dev-dependencies]
 criterion = "0.3.4"

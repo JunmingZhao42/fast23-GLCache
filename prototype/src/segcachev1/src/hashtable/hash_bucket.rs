@@ -72,17 +72,58 @@ pub(crate) const CLEAR_FREQ_SMOOTH_MASK: u64 = 0xFFF7_FFFF_FFFF_FFFF;
 /// Mask to get the lower 16 bits from a timestamp
 pub(crate) const PROC_TS_MASK: u64 = 0x0000_0000_0000_FFFF;
 
+/// Primary 3-words HashBucket
+/// - 1st word: bucket info
+/// - 2nd word: first item info
+/// - 3rd word: rest of the item-tags
 #[derive(Copy, Clone)]
-pub(crate) struct HashBucket {
-    pub(super) data: [u64; N_BUCKET_SLOT],
+pub(crate) struct PrimaryHashBucket {
+    pub(super) data: [u64; 3],
 }
 
-impl HashBucket {
+impl PrimaryHashBucket {
     pub fn new() -> Self {
         Self {
-            data: [0; N_BUCKET_SLOT],
+            data: [0; 3],
         }
     }
+}
+
+/// Secondary HashBucket
+/// Can be in datapool
+pub(crate) struct HashBucket<'a> {
+    pub(super) data: &'a mut [u64],
+}
+
+impl<'a> HashBucket<'a> {
+    pub fn from_raw_parts(
+        data_u8: &mut [u8],
+    ) -> Self {
+        let ptr: &mut [u64] = unsafe { std::mem::transmute(data_u8) };
+        let array: &mut [u64] = ptr.get_mut(0..N_BUCKET_SLOT).unwrap();
+
+        HashBucket { 
+            data: array
+        }
+    }
+
+    /// Reset hash bucket data to 0
+    pub fn _reset(&mut self) {
+        for i in 0..flash_bucket_size() {
+            self.data[i] = 0;
+        }
+    }
+}
+
+/// Return the size of each bucket in bytes
+#[inline]
+pub fn primary_bucket_size() -> usize {
+    8 * 2
+}
+
+#[inline]
+pub fn flash_bucket_size() -> usize {
+    8 * N_BUCKET_SLOT
 }
 
 /// Calculate a item's tag from the hash value

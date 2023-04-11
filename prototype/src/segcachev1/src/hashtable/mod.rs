@@ -123,6 +123,7 @@ impl HashTable {
             "hashtable has: {} primary slots across {} primary buckets and {} total buckets",
             slots, buckets, total_buckets,
         );
+        info!("Hashtable power: {}; HashBuckts: {}", power, buckets);
 
         let hash_builder = RandomState::with_seeds(
             0xbb8c484891ec6c86,

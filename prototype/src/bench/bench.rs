@@ -29,6 +29,10 @@ pub struct Bench {
 
 impl Bench {
     pub fn new(reader: Reader, cache: Cache, bench_time: i32, warmup_sec: i32, report_interval: i32) -> Bench {
+        info!("{} {} {}",
+            cache.get_name(), cache.get_size_in_mb(), 
+            reader.trace_path.split("/").last().unwrap()
+        );
         Bench {
             reader: reader,
             cache: cache,
@@ -71,9 +75,7 @@ impl Bench {
         let n_req = self.n_get + self.n_set + self.n_del;
         let trace_time_str = format!("{:.2}", self.trace_time as f64 / 3600.0);
 
-        println!("{} {}, {}, {} req, trace {} hour, {:.2} sec, throughput {:.2} MQPS, miss ratio {:.4}, interval miss ratio {:.4}", 
-            self.cache.get_name(), self.cache.get_size_in_mb(), 
-            self.reader.trace_path.split("/").last().unwrap(), 
+        println!("{} req, trace {} hour, {:.2} sec, throughput {:.2} MQPS, miss ratio {:.4}, interval miss ratio {:.4}", 
             self.n_get, trace_time_str, runtime, n_req as f64 / runtime / 1e6, 
             self.n_get_miss as f64 / self.n_get as f64, 
             self.n_get_miss_interval as f64 / self.n_get_interval as f64, 
@@ -106,7 +108,6 @@ impl Bench {
         buf.resize(1024*1024*8, 0);
 
         loop {
-            // println!("{}", request); 
             if !has_warmup && request.real_time as i32 - trace_start > self.warmup_sec {
                 self.n_get = 0;
                 self.n_set = 0;
@@ -119,7 +120,6 @@ impl Bench {
             }
             match self.reader.read(&mut request) { 
                 Ok(()) => {
-                    // println!("{}", request); 
                     match request.op {
                         Op::Get => {
                             self.n_get_interval += 1;

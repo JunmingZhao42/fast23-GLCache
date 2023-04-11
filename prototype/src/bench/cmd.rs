@@ -29,7 +29,7 @@ pub fn parse_args() -> Box<Args> {
         cache_type: String::from("l2cache"),
         trace_path: String::new(),
         trace_type: String::from("oracleGeneral"),
-        nottl: true,
+        nottl: false,
         use_oracle: false, 
         warmup_sec: 86400*3, 
         report_interval: 86400,

@@ -67,6 +67,8 @@
 
 // hashtable
 
+const PMEM_PATH: &str = "/mnt/pmem1.0/junming/";
+
 /// The number of slots within each bucket
 const N_BUCKET_SLOT: usize = 8;
 
@@ -74,14 +76,125 @@ const N_BUCKET_SLOT: usize = 8;
 const MAX_CHAIN_LEN: u64 = 16;
 
 use crate::*;
+use crate::datapool::*;
 use ahash::RandomState;
+use ::rand::thread_rng;
+use core::marker::PhantomData;
 use core::num::NonZeroU32;
+use chrono::Utc;
 
 use rustcommon_time::CoarseInstant as Instant;
 
 mod hash_bucket;
+use hash_bucket::bucket_size;
 
 pub(crate) use hash_bucket::*;
+
+#[derive(Debug)]
+struct IterState {
+    bucket_id: usize,
+    buckets_len: usize,
+    item_slot: usize,
+    chain_len: usize,
+    chain_idx: usize,
+    finished: bool,
+}
+
+impl IterState {
+    fn new(hashtable: &mut HashTable, hash: u64) -> Self {
+        let bucket_id = (hash & hashtable.mask) as usize;
+        let buckets_len = hashtable.length as usize;
+        let bucket = hashtable.get_bucket(bucket_id);
+        let chain_len = chain_len(bucket.data[0]) as usize;
+
+        Self {
+            bucket_id,
+            buckets_len,
+            // we start with item_slot 1 because slot 0 is metadata when in the
+            // first bucket in the chain
+            item_slot: 1,
+            chain_len,
+            chain_idx: 0,
+            finished: false,
+        }
+    }
+
+    fn n_item_slot(&self) -> usize {
+        // if this is the last bucket in the chain, the final slot contains item
+        // info entry, otherwise it points to the next bucket and should not be
+        // treated as an item slot
+        if self.chain_idx == self.chain_len {
+            N_BUCKET_SLOT
+        } else {
+            N_BUCKET_SLOT - 1
+        }
+    }
+}
+
+struct IterMut<'a> {
+    hashtable: &'a mut HashTable,
+    state: IterState,
+    // we need this marker to carry the lifetime since we must use a pointer
+    // instead of a reference for the mutable variant of the iterator
+    _marker: PhantomData<&'a mut u64>,
+}
+
+impl<'a> IterMut<'a> {
+    fn new(hashtable: &'a mut HashTable, hash: u64) -> Self {
+        let state = IterState::new(hashtable, hash);
+
+        Self {
+            hashtable,
+            state,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a> Iterator for IterMut<'a> {
+    type Item = &'a mut u64;
+
+    fn next(&mut self) -> Option<<Self as Iterator>::Item> {
+        #[cfg(feature = "htbl_usage")]
+        println!("Bucket Id:{}; Item slot:{}", self.state.bucket_id, self.state.item_slot);
+
+        if self.state.finished {
+            return None;
+        }
+
+        let n_item_slot = self.state.n_item_slot();
+
+        // SAFETY: this assert ensures memory safety for the pointer operations
+        // that follow as in-line unsafe blocks. We first check to make sure the
+        // bucket_id is within range for the slice of buckets. As long as this
+        // holds true, the pointer operations are safe.
+        assert!(
+            self.state.bucket_id < self.state.buckets_len,
+            "bucket id not in range"
+        );
+
+        let bucket = self.hashtable.get_bucket(self.state.bucket_id);
+        let item_info: &'a mut u64 = unsafe {
+            std::mem::transmute(bucket.data.get_mut(self.state.item_slot).unwrap())
+        };
+
+        if self.state.item_slot < n_item_slot - 1 {
+            self.state.item_slot += 1;
+        } else {
+            // finished iterating in this bucket, see if it's chained
+            if self.state.chain_idx < self.state.chain_len {
+                self.state.chain_idx += 1;
+                self.state.item_slot = 0;
+                let next_bucket_id = *(bucket.data.get(N_BUCKET_SLOT - 1).unwrap()) as usize;
+                self.state.bucket_id = next_bucket_id;
+            } else {
+                self.state.finished = true;
+            }
+        }
+
+        Some(item_info)
+    }
+}
 
 /// Main structure for performing item lookup. Contains a contiguous allocation
 /// of [`HashBucket`]s which are used to store item info and metadata.
@@ -90,10 +203,10 @@ pub(crate) struct HashTable {
     hash_builder: Box<RandomState>,
     power: u64,
     mask: u64,
-    data: Box<[HashBucket]>,
-    rng: Box<Random>,
+    data: Box<dyn Datapool>,
     started: CoarseInstant,
     next_to_chain: u64,
+    length: u64,
 }
 
 impl HashTable {
@@ -115,15 +228,24 @@ impl HashTable {
         let mask = buckets - 1;
 
         let total_buckets = (buckets as f64 * (1.0 + overflow_factor)).ceil() as usize;
-
-        let mut data = Vec::with_capacity(0);
-        data.reserve_exact(total_buckets as usize);
-        data.resize(total_buckets as usize, HashBucket::new());
+        let data_size = total_buckets * bucket_size();
+        let path = &format!(
+            "{}hashtable-{}",
+            PMEM_PATH,
+            Utc::now().format("%T")
+        );
+        debug!("total data size in bytes {}", data_size);
         debug!(
             "hashtable has: {} primary slots across {} primary buckets and {} total buckets",
             slots, buckets, total_buckets,
         );
         info!("Hashtable power: {}; HashBuckts: {}", power, buckets);
+
+        let data: Box<dyn Datapool> = Box::new(
+            File::create(path, data_size, true)
+            .expect("cannot alloc for hashtable")
+        );
+        // NOTE: Memery::create() by default zeros the area, so we don't need to init slots.
 
         let hash_builder = RandomState::with_seeds(
             0xbb8c484891ec6c86,
@@ -136,11 +258,22 @@ impl HashTable {
             hash_builder: Box::new(hash_builder),
             power: power.into(),
             mask,
-            data: data.into_boxed_slice(),
-            rng: Box::new(rng()),
+            data: data,
             started: Instant::recent(),
             next_to_chain: buckets as u64,
+            length: buckets,
         }
+    }
+
+    /// Get mutable hash bucket by the id
+    pub fn get_bucket(&mut self, bucket_id: usize) -> HashBucket {
+        // MY-TODO: multiply by bucket size
+        let begin = bucket_size() * bucket_id;
+        let end = bucket_size() * (bucket_id + 1);
+        let hash_bucket = HashBucket::from_raw_parts(
+            &mut self.data.as_mut_slice()[begin..end],
+        );
+        hash_bucket
     }
 
     /// Lookup an item by key and return it
@@ -149,90 +282,48 @@ impl HashTable {
         let tag = tag_from_hash(hash);
         let bucket_id = hash & self.mask;
 
-        let mut bucket = &mut self.data[bucket_id as usize];
-        let chain_len = chain_len(bucket.data[0]);
-        let mut chain_idx = 0;
-
+        let bucket_info = self.get_bucket(bucket_id as usize).data[0];
         trace!("hash: {} mask: {} bucket: {}", hash, self.mask, bucket_id);
 
         let curr_ts = (Instant::recent() - self.started).as_secs() as u64 & PROC_TS_MASK;
-        if curr_ts != get_ts(bucket.data[0]) {
-            bucket.data[0] = (bucket.data[0] & !TS_MASK) | (curr_ts << TS_BIT_SHIFT);
 
-            loop {
-                let n_item_slot = if chain_idx == chain_len {
-                    N_BUCKET_SLOT
-                } else {
-                    N_BUCKET_SLOT - 1
-                };
+        if curr_ts != get_ts(bucket_info) {
+            self.get_bucket(bucket_id as usize).data[0] = (bucket_info & !TS_MASK) | (curr_ts as u64);
 
-                for i in 0..n_item_slot {
-                    if chain_idx == 0 && i == 0 {
-                        continue;
-                    }
-                    bucket.data[i] &= CLEAR_FREQ_SMOOTH_MASK;
-                }
-
-                if chain_idx == chain_len {
-                    break;
-                }
-                bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-                chain_idx += 1;
+            let iter = IterMut::new(self, hash);
+            for item_info in iter {
+                *item_info &= CLEAR_FREQ_SMOOTH_MASK;
             }
-
-            // reset to start of chain
-            chain_idx = 0;
-            bucket = &mut self.data[bucket_id as usize];
         }
 
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
+        let iter = IterMut::new(self, hash);
 
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-
-                let current_info = bucket.data[i];
-
-                if get_tag(current_info) == tag {
-                    let current_item = segments.get_item(current_info).unwrap();
-                    if current_item.key() != key {
-                    } else {
-                        // update item frequency
-                        let mut freq = get_freq(current_info);
-                        if freq < 127 {
-                            let rand: u64 = self.rng.gen();
-                            if freq <= 16 || rand % freq == 0 {
-                                freq = ((freq + 1) | 0x80) << FREQ_BIT_SHIFT;
-                            } else {
-                                freq = (freq | 0x80) << FREQ_BIT_SHIFT;
-                            }
-                            if bucket.data[i] == current_info {
-                                bucket.data[i] = (current_info & !FREQ_MASK) | freq;
-                            }
+        for item_info in iter {
+            if get_tag(*item_info) == tag {
+                let current_item = segments.get_item(*item_info).unwrap();
+                if current_item.key() != key {
+                } else {
+                    // update item frequency
+                    let mut freq = get_freq(*item_info);
+                    if freq < 127 {
+                        let rand = thread_rng().gen::<u64>();
+                        if freq <= 16 || rand % freq == 0 {
+                            freq = ((freq + 1) | 0x80) << FREQ_BIT_SHIFT;
+                        } else {
+                            freq = (freq | 0x80) << FREQ_BIT_SHIFT;
                         }
-
-                        let item = Item::new(
-                            current_item,
-                            get_cas(self.data[(hash & self.mask) as usize].data[0]),
-                        );
-                        item.check_magic();
-
-                        return Some(item);
+                        *item_info = (*item_info & !FREQ_MASK) | freq;
                     }
+
+                    let item = Item::new(
+                        current_item,
+                        get_cas(self.get_bucket((hash & self.mask) as usize).data[0]),
+                    );
+                    item.check_magic();
+
+                    return Some(item);
                 }
             }
-
-            if chain_idx == chain_len {
-                break;
-            }
-            bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-            chain_idx += 1;
         }
 
         None
@@ -243,49 +334,25 @@ impl HashTable {
     /// not want a successful item lookup to count as a hit for that item.
     pub fn get_no_freq_incr(&mut self, key: &[u8], segments: &mut Segments) -> Option<Item> {
         let hash = self.hash(key);
+
+        let iter = IterMut::new(self, hash);
+
         let tag = tag_from_hash(hash);
-        let bucket_id = hash & self.mask;
 
-        let mut bucket = &mut self.data[bucket_id as usize];
-        let chain_len = chain_len(bucket.data[0]);
-        let mut chain_idx = 0;
+        for item_info in iter {
+            if get_tag(*item_info) == tag {
+                let current_item = segments.get_item(*item_info).unwrap();
+                if current_item.key() != key {
+                } else {
+                    let item = Item::new(
+                        current_item,
+                        get_cas(self.get_bucket((hash & self.mask) as usize).data[0]),
+                    );
+                    item.check_magic();
 
-        trace!("hash: {} mask: {} bucket: {}", hash, self.mask, bucket_id);
-
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
-
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-
-                let current_info = bucket.data[i];
-
-                if get_tag(current_info) == tag {
-                    let current_item = segments.get_item(current_info).unwrap();
-                    if current_item.key() != key {
-                    } else {
-                        let item = Item::new(
-                            current_item,
-                            get_cas(self.data[(hash & self.mask) as usize].data[0]),
-                        );
-                        item.check_magic();
-
-                        return Some(item);
-                    }
+                    return Some(item);
                 }
             }
-
-            if chain_idx == chain_len {
-                break;
-            }
-            bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-            chain_idx += 1;
         }
 
         None
@@ -295,41 +362,16 @@ impl HashTable {
     pub fn get_freq(&mut self, key: &[u8], segment: &mut Segment, offset: u64) -> Option<u64> {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
-        let bucket_id = hash & self.mask;
 
-        let mut bucket = &mut self.data[bucket_id as usize];
-        let chain_len = chain_len(bucket.data[0]);
-        let mut chain_idx = 0;
+        let iter = IterMut::new(self, hash);
 
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
-
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-                let current_info = bucket.data[i];
-
-                // we can't actually check for a collision here since the item
-                // may be in another segment, so just check if it's at the same
-                // offset in the segment and treat that as a match
-                if get_tag(current_info) == tag
-                    && get_seg_id(current_info) == Some(segment.id())
-                    && get_offset(current_info) == offset
-                {
-                    return Some(get_freq(current_info) & 0x7F);
-                }
+        for item_info in iter {
+            if get_tag(*item_info) == tag
+                && get_seg_id(*item_info) == Some(segment.id())
+                && get_offset(*item_info) == offset
+            {
+                return Some(get_freq(*item_info) & 0x7F);
             }
-
-            if chain_idx == chain_len {
-                break;
-            }
-            bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-            chain_idx += 1;
         }
 
         None
@@ -347,55 +389,18 @@ impl HashTable {
     ) -> Result<(), ()> {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
-        let bucket_id = hash & self.mask;
+        let iter = IterMut::new(self, hash);
 
-        let mut bucket = &mut self.data[bucket_id as usize];
-        let chain_len = chain_len(bucket.data[0]);
-        let mut chain_idx = 0;
-
-        let mut updated = false;
-
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
-
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-                let current_info = bucket.data[i];
-
-                if get_tag(current_info) == tag {
-                    if get_seg_id(current_info) == Some(old_seg)
-                        && get_offset(current_info) == old_offset
-                    {
-                        if !updated {
-                            let new_item_info = build_item_info(tag, new_seg, new_offset);
-                            bucket.data[i] = new_item_info;
-                            updated = true;
-                        } else {
-                            bucket.data[i] = 0;
-                        }
-                    } else {
-                    }
+        for item_info in iter {
+            if get_tag(*item_info) == tag {
+                if get_seg_id(*item_info) == Some(old_seg) && get_offset(*item_info) == old_offset {
+                    *item_info = build_item_info(tag, new_seg, new_offset);
+                    return Ok(());
                 }
             }
-
-            if chain_idx == chain_len {
-                break;
-            }
-            bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-            chain_idx += 1;
         }
 
-        if updated {
-            Ok(())
-        } else {
-            Err(())
-        }
+        Err(())
     }
 
     /// Inserts a new item into the hashtable. This may fail if the hashtable is
@@ -412,68 +417,67 @@ impl HashTable {
 
         let hash = self.hash(item.key());
         let tag = tag_from_hash(hash);
-        let mut bucket_id = (hash & self.mask) as usize;
-        let chain_len = chain_len(self.data[bucket_id].data[0]);
-        let mut chain_idx = 0;
 
         // check the item magic
         item.check_magic();
 
         let mut insert_item_info = build_item_info(tag, seg, offset);
 
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
+        let mut removed: Option<u64> = None;
 
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-                let current_item_info = self.data[bucket_id].data[i];
-                if get_tag(current_item_info) != tag {
-                    if insert_item_info != 0 && current_item_info == 0 {
-                        // found a blank slot
-                        self.data[bucket_id].data[i] = insert_item_info;
-                        insert_item_info = 0;
-                    }
-                    continue;
-                }
-                if segments.get_item(current_item_info).unwrap().key() != item.key() {
-                } else {
-                    // update existing key
-                    self.data[bucket_id].data[i] = insert_item_info;
-                    let _ = segments.remove_item(current_item_info, true, ttl_buckets, self);
+        let iter = IterMut::new(self, hash);
+
+        for item_info in iter {
+            if get_tag(*item_info) != tag {
+                if insert_item_info != 0 && *item_info == 0 {
+                    // found a blank slot
+                    *item_info = insert_item_info;
                     insert_item_info = 0;
+                    break;
                 }
+                continue;
             }
-
-            if chain_idx == chain_len {
+            if segments.get_item(*item_info).unwrap().key() != item.key() {
+            } else {
+                // update existing key
+                removed = Some(*item_info);
+                *item_info = insert_item_info;
+                insert_item_info = 0;
                 break;
             }
-            bucket_id = self.data[bucket_id].data[N_BUCKET_SLOT - 1] as usize;
-            chain_idx += 1;
         }
 
-        if insert_item_info != 0
-            && chain_len < MAX_CHAIN_LEN
-            && (self.next_to_chain as usize) < self.data.len()
-        {
-            let next_id = self.next_to_chain as usize;
-            self.next_to_chain += 1;
+        if let Some(removed_item) = removed {
+            let _ = segments.remove_item(removed_item, true, ttl_buckets, self);
+        }
 
-            self.data[next_id].data[0] = self.data[bucket_id].data[N_BUCKET_SLOT - 1];
-            self.data[next_id].data[1] = insert_item_info;
-            insert_item_info = 0;
-            self.data[bucket_id].data[N_BUCKET_SLOT - 1] = next_id as u64;
+        // bulk-chaining of hashtable happens here
+        if insert_item_info != 0 {
 
-            self.data[(hash & self.mask) as usize].data[0] += 0x0001_0000_0000_0000;
+            let mut bucket_id = (hash & self.mask) as usize;
+            let chain_len = chain_len(self.get_bucket(bucket_id).data[0]);
+
+            if (chain_len < MAX_CHAIN_LEN) && (self.next_to_chain < self.length){
+                // we need to chase through the buckets to get the id of the last
+                // bucket in the chain
+                for _ in 0..chain_len {
+                    bucket_id = self.get_bucket(bucket_id).data[N_BUCKET_SLOT - 1] as usize;
+                }
+
+                let next_id = self.next_to_chain as usize;
+                self.next_to_chain += 1;
+
+                self.get_bucket(next_id).data[0] = self.get_bucket(bucket_id).data[N_BUCKET_SLOT - 1];
+                self.get_bucket(next_id).data[1] = insert_item_info;
+                insert_item_info = 0;
+                self.get_bucket(bucket_id).data[N_BUCKET_SLOT - 1] = next_id as u64;
+
+                self.get_bucket((hash & self.mask) as usize).data[0] += 0x0000_0000_0001_0000;
+            }
         }
 
         if insert_item_info == 0 {
-            self.data[(hash & self.mask) as usize].data[0] += 1;
+            self.get_bucket((hash & self.mask) as usize).data[0] += 1;
             Ok(())
         } else {
             Err(())
@@ -498,58 +502,33 @@ impl HashTable {
         let tag = tag_from_hash(hash);
         let bucket_id = hash & self.mask;
 
-        let mut bucket = &mut self.data[bucket_id as usize];
-        let chain_len = chain_len(bucket.data[0]);
-        let mut chain_idx = 0;
+        let iter = IterMut::new(self, hash);
 
-        trace!("hash: {} mask: {} bucket: {}", hash, self.mask, bucket_id);
-
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-                let current_info = bucket.data[i];
-
-                if get_tag(current_info) == tag {
-                    let current_item = segments.get_item(current_info).unwrap();
-                    if current_item.key() != key {
-                    } else {
-                        // update item frequency
-                        let mut freq = get_freq(current_info);
-                        if freq < 127 {
-                            let rand: u64 = self.rng.gen();
-                            if freq <= 16 || rand % freq == 0 {
-                                freq = ((freq + 1) | 0x80) << FREQ_BIT_SHIFT;
-                            } else {
-                                freq = (freq | 0x80) << FREQ_BIT_SHIFT;
-                            }
-                            if bucket.data[i] == current_info {
-                                bucket.data[i] = (current_info & !FREQ_MASK) | freq;
-                            }
-                        }
-
-                        if cas == get_cas(bucket.data[0]) {
-                            // TODO(bmartin): what is expected on overflow of the cas bits?
-                            self.data[(hash & self.mask) as usize].data[0] += 1;
-                            return Ok(());
+        for item_info in iter {
+            if get_tag(*item_info) == tag {
+                let item = segments.get_item(*item_info).unwrap();
+                if item.key() != key {
+                } else {
+                    // update item frequency
+                    let mut freq = get_freq(*item_info);
+                    if freq < 127 {
+                        let rand = thread_rng().gen::<u64>();
+                        if freq <= 16 || rand % freq == 0 {
+                            freq = ((freq + 1) | 0x80) << FREQ_BIT_SHIFT;
                         } else {
-                            return Err(SegError::Exists);
+                            freq = (freq | 0x80) << FREQ_BIT_SHIFT;
                         }
+                        *item_info = (*item_info & !FREQ_MASK) | freq;
+                    }
+
+                    if cas == get_cas(self.get_bucket(bucket_id as usize).data[0]) {
+                        self.get_bucket(bucket_id as usize).data[0] += 1;
+                        return Ok(());
+                    } else {
+                        return Err(SegError::Exists);
                     }
                 }
             }
-
-            if chain_idx == chain_len {
-                break;
-            }
-            bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-            chain_idx += 1;
         }
 
         Err(SegError::NotFound)
@@ -564,63 +543,41 @@ impl HashTable {
     ) -> bool {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
-        let mut bucket_id = (hash & self.mask) as usize;
-        let chain_len = chain_len(self.data[bucket_id].data[0]);
-        let mut chain_idx = 0;
 
-        let mut deleted = false;
+        let iter = IterMut::new(self, hash);
 
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
+        let mut removed: Option<u64> = None;
+
+        for item_info in iter {
+            if get_tag(*item_info) == tag {
+                let item = segments.get_item(*item_info).unwrap();
+                if item.key() != key {
                     continue;
-                }
-                let current_item_info = self.data[bucket_id].data[i];
-
-                if get_tag(current_item_info) == tag {
-                    let current_item = segments.get_item(current_item_info).unwrap();
-                    if current_item.key() != key {
-                        continue;
-                    } else {
-                        let _ =
-                            segments.remove_item(current_item_info, !deleted, ttl_buckets, self);
-                        self.data[bucket_id].data[i] = 0;
-                        deleted = true;
-                    }
+                } else {
+                    removed = Some(*item_info);
+                    *item_info = 0;
+                    break;
                 }
             }
-
-            if chain_idx == chain_len {
-                break;
-            }
-            bucket_id = self.data[bucket_id].data[N_BUCKET_SLOT - 1] as usize;
-            chain_idx += 1;
         }
 
-        if deleted {
+        if let Some(removed_item) = removed {
+            let _ = segments.remove_item(removed_item, true, ttl_buckets, self);
+            true
+        } else {
+            false
         }
-
-        deleted
     }
 
     /// Evict a single item from the cache
     pub fn evict(&mut self, key: &[u8], offset: i32, segment: &mut Segment) -> bool {
         let result = self.remove_from(key, offset, segment);
-        if result {
-        }
         result
     }
 
     /// Expire a single item from the cache
     pub fn expire(&mut self, key: &[u8], offset: i32, segment: &mut Segment) -> bool {
         let result = self.remove_from(key, offset, segment);
-        if result {
-        }
         result
     }
 
@@ -628,63 +585,30 @@ impl HashTable {
     fn remove_from(&mut self, key: &[u8], offset: i32, segment: &mut Segment) -> bool {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
-        let bucket_id = hash & self.mask;
-
-        let mut bucket = &mut self.data[bucket_id as usize];
-        let chain_len = chain_len(bucket.data[0]);
-        let mut chain_idx = 0;
-
         let evict_item_info = build_item_info(tag, segment.id(), offset as u64);
 
-        let mut evicted = false;
-        let mut outdated = true;
-        let mut first_match = true;
+        let iter = IterMut::new(self, hash);
 
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-                let current_item_info = clear_freq(bucket.data[i]);
-                if get_tag(current_item_info) != tag {
-                    continue;
-                }
-                if get_seg_id(current_item_info) != Some(segment.id())
-                    || get_offset(current_item_info) != offset as _
-                {
-                    continue;
-                }
+        for item_info in iter {
+            let current_item_info = clear_freq(*item_info);
+            if get_tag(current_item_info) != tag {
+                continue;
+            }
 
-                if first_match {
-                    if evict_item_info == current_item_info {
-                        segment.remove_item(current_item_info, false);
-                        bucket.data[i] = 0;
-                        outdated = false;
-                        evicted = true;
-                    }
-                    first_match = false;
-                    continue;
-                } else {
-                    if !evicted && current_item_info == evict_item_info {
-                        evicted = true;
-                    }
-                    segment.remove_item(bucket.data[i], !outdated);
-                    bucket.data[i] = 0;
-                }
+            if get_seg_id(current_item_info) != Some(segment.id())
+                || get_offset(current_item_info) != offset as u64
+            {
+                continue;
             }
-            if chain_idx == chain_len {
-                break;
+
+            if evict_item_info == current_item_info {
+                segment.remove_item(current_item_info, false);
+                *item_info = 0;
+                return true;
             }
-            bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-            chain_idx += 1;
         }
 
-        evicted
+        false
     }
 
     /// Internal function used to calculate a hash value for a key

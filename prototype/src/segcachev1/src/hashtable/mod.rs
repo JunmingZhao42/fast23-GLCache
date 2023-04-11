@@ -226,7 +226,6 @@ pub(crate) struct HashTable {
     buckets_num: u64,
     buckets_num_: u64,
     _pad: [u8; 40],
-    // TODO: check the size of this struct
 }
 
 impl HashTable {
@@ -243,7 +242,7 @@ impl HashTable {
 
         // # 2^power slots that can fit in DRAM with mem=2^(power+3) bytes 
         let slots = 1_u64 << power;
-        let buckets = slots >> 1;
+        let buckets = slots >> 2;
         let mask = buckets - 1;
 
         // Allcoate in DRAM
@@ -311,8 +310,6 @@ impl HashTable {
         let tag = tag_from_hash(hash);
         let bucket_id = hash & self.mask;
 
-        // let mut bucket = &mut self.data[bucket_id as usize];
-        // MY-TODO: use some other ways to implement smoothing frequency method
         let bucket_info = self.data[bucket_id as usize].data[0];
         let curr_ts = (Instant::recent() - self.started).as_secs() as u64 & PROC_TS_MASK;
 

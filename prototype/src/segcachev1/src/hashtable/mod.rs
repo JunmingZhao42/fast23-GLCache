@@ -67,8 +67,6 @@
 
 // hashtable
 
-const PMEM_PATH: &str = "/mnt/pmem1.0/junming/";
-
 /// The number of slots within each bucket
 const N_BUCKET_SLOT: usize = 8;
 
@@ -80,7 +78,6 @@ use crate::datapool::*;
 use ahash::RandomState;
 use ::rand::thread_rng;
 use core::num::NonZeroU32;
-use chrono::Utc;
 
 use rustcommon_time::CoarseInstant as Instant;
 
@@ -240,17 +237,8 @@ impl HashTable {
 
         // Allocate in Flash
         let total_buckets_flash = (buckets as f64 * (1.0 + overflow_factor)).ceil() as usize;
-        let path = &format!(
-            "{}hb3-htbl-{}",
-            PMEM_PATH,
-            Utc::now().format("%T")
-        );
         let data_size_flash = total_buckets_flash * flash_bucket_size();
-        let data_flash: Box<dyn Datapool> = Box::new(
-            File::create(path, data_size_flash, true)
-            .expect("cannot mmap hashtable to file")
-        );
-        // NOTE: Memery::create() by default zeros the area, so we don't need to init slots.
+        let data_flash: Box<dyn Datapool> = Box::new(Memory::create(data_size_flash, true));
 
         debug!("Flash hashtable size in bytes {}", data_size_flash);
         info!(

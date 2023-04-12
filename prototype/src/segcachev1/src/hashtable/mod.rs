@@ -79,7 +79,6 @@ use crate::*;
 use crate::datapool::*;
 use ahash::RandomState;
 use ::rand::thread_rng;
-use core::marker::PhantomData;
 use core::num::NonZeroU32;
 use chrono::Utc;
 
@@ -135,9 +134,6 @@ struct IterMut<'a> {
     ptr: *mut PrimaryHashBucket,
     hashtable: &'a mut HashTable,
     state: IterState,
-    // we need this marker to carry the lifetime since we must use a pointer
-    // instead of a reference for the mutable variant of the iterator
-    _marker: PhantomData<&'a mut u64>,
 }
 
 impl<'a> IterMut<'a> {
@@ -151,7 +147,6 @@ impl<'a> IterMut<'a> {
             ptr,
             hashtable,
             state,
-            _marker: PhantomData,
         }
     }
 }
@@ -187,9 +182,9 @@ impl<'a> Iterator for IterMut<'a> {
         );
 
         // get Flash data
-        let bucket = self.hashtable.get_bucket_flash(self.state.bucket_id);
-        let item_info: &'a mut u64 = unsafe {
-            std::mem::transmute(bucket.data.get_mut(self.state.item_slot).unwrap())
+        let idx = flash_bucket_size() * (self.state.bucket_id + 1) + self.state.item_slot * 8;
+        let item_info: &mut u64 = unsafe {
+            std::mem::transmute(&mut self.hashtable.data_flash.as_mut_slice()[idx])
         };
 
         // update iter state
@@ -200,6 +195,7 @@ impl<'a> Iterator for IterMut<'a> {
             if self.state.chain_idx < self.state.chain_len {
                 self.state.chain_idx += 1;
                 self.state.item_slot = 0;
+                let bucket = self.hashtable.get_bucket_flash(self.state.bucket_id);
                 let next_bucket_id = *(bucket.data.get(N_BUCKET_SLOT - 1).unwrap()) as usize;
                 self.state.bucket_id = next_bucket_id;
             } else {
@@ -242,7 +238,7 @@ impl HashTable {
 
         // # 2^power slots that can fit in DRAM with mem=2^(power+3) bytes 
         let slots = 1_u64 << power;
-        let buckets = slots >> 2;
+        let buckets = slots >> 3;
         let mask = buckets - 1;
 
         // Allcoate in DRAM
@@ -304,6 +300,12 @@ impl HashTable {
         hash_bucket
     }
 
+    pub fn get_next_bucket_id(&self, bucket_id: usize) -> usize {
+        let end = flash_bucket_size() * (bucket_id + 1);
+        let x = self.data_flash.as_slice()[end - 1] as usize;
+        x
+    }
+
     /// Lookup an item by key and return it
     pub fn get(&mut self, key: &[u8], segments: &mut Segments) -> Option<Item> {
         let hash = self.hash(key);
@@ -328,14 +330,18 @@ impl HashTable {
         let iter = IterMut::new(self, hash);
         let mut iter_times = 0;
         for current_info in iter {
-            if iter_times > 0 && !tag_exists {
+            if iter_times > 0 && tag_exists.is_none() {
                 return None;
+            } else if let Some(i) = tag_exists {
+                if iter_times < i {
+                    iter_times += 1;
+                    continue;
+                }
             }
 
             if get_tag(*current_info) == tag {
                 let current_item = segments.get_item(*current_info).unwrap();
-                if current_item.key() != key {
-                } else {
+                if current_item.key() == key {
                     // update item frequency
                     let mut freq = get_freq(*current_info);
                     if freq < 127 {
@@ -374,8 +380,7 @@ impl HashTable {
         for current_info in iter {
             if get_tag(*current_info) == tag {
                 let current_item = segments.get_item(*current_info).unwrap();
-                if current_item.key() != key {
-                } else {
+                if current_item.key() == key {
                     let item = Item::new(
                         current_item,
                         get_cas(self.data[(hash & self.mask) as usize].data[0]),
@@ -429,7 +434,6 @@ impl HashTable {
                 if get_seg_id(*current_info) == Some(old_seg) && get_offset(*current_info) == old_offset {
                     *current_info = build_item_info(tag, new_seg, new_offset);
                     return Ok(());
-                } else {
                 }
             }
         }
@@ -492,8 +496,11 @@ impl HashTable {
         // Add reduced tag bits
         // we don't want to record the first DRAM slot
         if iter_time > 0 && insert_item_info == 0 {
-            self.data[bucket_id].data[2] &= !(0xff << (iter_time-1)*8);
-            self.data[bucket_id].data[2] |= ((tag >> 52) & 0xff) << (iter_time-1)*8;
+            let x = &mut self.data[bucket_id].data[2];
+            // clear the original tag
+            *x &= !(0xff << (iter_time-1)*8);
+            // add current tag
+            *x |= ((tag >> 52) & 0xff) << (iter_time-1)*8;
         }
 
         if let Some(removed_item) = removed {
@@ -511,18 +518,20 @@ impl HashTable {
                 // we need to chase through the buckets to get the id of the last
                 // bucket in the chain
                 for _ in 0..chain_len {
-                    bucket_id = self.get_bucket_flash(bucket_id).data[N_BUCKET_SLOT - 1] as usize;
+                    bucket_id = self.get_next_bucket_id(bucket_id);
                 }
 
                 // chain (next_to_chain)th HashBucket from the Flash section
                 let next_id = self.next_to_chain as usize;
                 self.next_to_chain += 1;
 
-                self.get_bucket_flash(next_id).data[0] = self.get_bucket_flash(bucket_id).data[N_BUCKET_SLOT - 1];
-                self.get_bucket_flash(bucket_id).data[1] = insert_item_info;
+                self.get_bucket_flash(next_id).data[0] = self.get_next_bucket_id(bucket_id) as u64;
+
+                let current_bucket = self.get_bucket_flash(bucket_id);
+                current_bucket.data[1] = insert_item_info;
 
                 insert_item_info = 0;
-                self.get_bucket_flash(bucket_id).data[N_BUCKET_SLOT - 1] = next_id as u64;
+                current_bucket.data[N_BUCKET_SLOT - 1] = next_id as u64;
 
                 self.data[(hash & self.mask) as usize].data[0] += 0x0001_0000_0000_0000;
             }
@@ -560,8 +569,7 @@ impl HashTable {
         for item_info in iter {
             if get_tag(*item_info) == tag {
                 let item = segments.get_item(*item_info).unwrap();
-                if item.key() != key {
-                } else {
+                if item.key() == key {
                     // update item frequency
                     let mut freq = get_freq(*item_info);
                     if freq < 127 {
@@ -642,21 +650,29 @@ impl HashTable {
 
         let iter = IterMut::new(self, hash);
 
+        let mut iter_time = 0;
         for item_info in iter {
             let current_item_info = clear_freq(*item_info);
             if get_tag(current_item_info) != tag {
+                iter_time += 1;
                 continue;
             }
 
             if get_seg_id(current_item_info) != Some(segment.id())
                 || get_offset(current_item_info) != offset as u64
             {
+                iter_time += 1;
                 continue;
             }
 
             if evict_item_info == current_item_info {
                 segment.remove_item(current_item_info, false);
                 *item_info = 0;
+
+                if iter_time > 0 {
+                    let bucket_id = (hash & self.mask) as usize;
+                    self.data[bucket_id].data[2] &= !(0xff << (iter_time-1)*8);
+                }
                 return true;
             }
         }
@@ -673,10 +689,10 @@ impl HashTable {
 
     /// Internal function used to check if tag from hash(key) corresponds to
     /// one of the tags in metadata
-    fn check_reduced_tag(&self, key: &[u8]) -> bool {
-        // get the tag
+    fn check_reduced_tag(&self, key: &[u8]) -> Option<usize> {
+        // get the shifted tag
         let hash = self.hash(key);
-        let tag = tag_from_hash(hash);
+        let tag = tag_from_hash(hash) >> 52;
         
         // get the metadata tags
         let tags = self.data[(hash & self.mask) as usize].data[2];
@@ -684,10 +700,10 @@ impl HashTable {
 
         // MY-TODO: extract reduced tag length to configs
         for i in 0..8 {
-            if ((tag >> 52) & mask_tmp) == ((tags >> (i*8)) & mask_tmp) {
-                return true;
+            if (tag & mask_tmp) == ((tags >> (i*8)) & mask_tmp) {
+                return Some(i);
             }
         }
-        false
+        None
     }
 }

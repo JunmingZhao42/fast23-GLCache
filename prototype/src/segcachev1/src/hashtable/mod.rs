@@ -182,7 +182,7 @@ impl<'a> Iterator for IterMut<'a> {
         let ptr: &mut [u64] = unsafe {
             std::mem::transmute(self.hashtable.data_flash.as_mut_slice())
         };
-        let item_info = &mut ptr[self.state.bucket_id * 8 + self.state.item_slot]; 
+       let item_info = &mut ptr[self.state.bucket_id * 8 + self.state.item_slot]; 
 
         // update iter state
         if self.state.item_slot < n_item_slot - 1 {

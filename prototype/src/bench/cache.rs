@@ -36,7 +36,6 @@ pub fn create_cache(args: &Box<Args>) -> Cache {
                 .segment_size((args.segment_size_in_kb * KB) as i32)
                 .heap_size(args.cache_size_in_mb * MB)
                 .hash_power(args.hash_power)
-                .overflow_factor(1.0)
                 .eviction(segv1::Policy::Merge {
                     max: 16,
                     merge: 4,
@@ -56,7 +55,7 @@ pub fn create_cache(args: &Box<Args>) -> Cache {
                 .segment_size((args.segment_size_in_kb * KB) as i32)
                 .heap_size(args.cache_size_in_mb * MB)
                 .hash_power(args.hash_power)
-                .overflow_factor(1.0);
+                ;
             // cb = cb.eviction(l2cache::Policy::Fifo);
             // cb = cb.eviction(l2cache::Policy::Merge {
             //     max: 128,

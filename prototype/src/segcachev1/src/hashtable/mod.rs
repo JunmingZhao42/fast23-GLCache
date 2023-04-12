@@ -182,7 +182,7 @@ impl<'a> Iterator for IterMut<'a> {
         );
 
         // get Flash data
-        let idx = flash_bucket_size() * (self.state.bucket_id + 1) + self.state.item_slot * 8;
+        let idx = flash_bucket_size() * (self.state.bucket_id) + self.state.item_slot * 8;
         let item_info: &mut u64 = unsafe {
             std::mem::transmute(&mut self.hashtable.data_flash.as_mut_slice()[idx])
         };
@@ -219,9 +219,7 @@ pub(crate) struct HashTable {
     started: CoarseInstant,
     next_to_chain: u64,
     data_flash: Box<dyn Datapool>,
-    buckets_num: u64,
-    buckets_num_: u64,
-    _pad: [u8; 40],
+    _pad : [u8; 56],
 }
 
 impl HashTable {
@@ -263,7 +261,7 @@ impl HashTable {
         // NOTE: Memery::create() by default zeros the area, so we don't need to init slots.
 
         debug!("Flash hashtable size in bytes {}", data_size_flash);
-        debug!(
+        info!(
             "hashtable has: {} primary slots across {} primary buckets and {} total buckets",
             slots, buckets, total_buckets_flash,
         );
@@ -284,9 +282,7 @@ impl HashTable {
             started: Instant::recent(),
             next_to_chain: buckets as u64,
             data_flash: data_flash,
-            buckets_num: buckets,
-            buckets_num_: total_buckets_flash as u64,
-            _pad: [0; 40],
+            _pad : [0; 56],
         }
     }
 

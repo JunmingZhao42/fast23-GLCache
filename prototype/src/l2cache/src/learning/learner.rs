@@ -2,6 +2,10 @@
 
 use crate::segments::*;
 use xgboost::{parameters, DMatrix, Booster};
+use neuroflow::FeedForward;
+use neuroflow::activators::Type::Tanh;
+use neuroflow::data::{DataSet, Extractable};
+
 use crate::*;
 use log::{info, warn};
 use std::time::Instant;
@@ -39,7 +43,8 @@ pub struct L2Learner {
 
     inference_x: Vec<f32>,
 
-    bst: Option<Booster>, 
+    // bst: Option<Booster>, 
+    bst: Option<FeedForward>,
 }
 
 fn gen_x_from_header(header: &SegmentHeader, base_x: &mut [f32], idx: usize) {
@@ -58,19 +63,6 @@ fn gen_x_from_header(header: &SegmentHeader, base_x: &mut [f32], idx: usize) {
     x[7] = header.n_merge as f32;
     x[8] = header.n_req as f32;
     x[9] = header.n_active as f32;
-
-    // x[0] = quickrandom() as f32;
-    // for i in 1..10 {
-    //     x[i] = 0.0; 
-    // }
-
-    // if header.n_merge > 0 {
-    //     x[9] = header.n_req as f32 / (CoarseInstant::recent().as_secs() - header.merge_at().as_secs() + 1) as f32;
-    //     x[10]= header.n_active as f32 / (CoarseInstant::recent().as_secs() - header.merge_at().as_secs() + 1) as f32;
-    // } else {
-    //     x[9] = header.n_req as f32 / (CoarseInstant::recent().as_secs() - header.create_at().as_secs() + 1) as f32;
-    //     x[10]= header.n_active as f32 / (CoarseInstant::recent().as_secs() - header.create_at().as_secs() + 1) as f32;
-    // }
 }
 
 
@@ -229,26 +221,6 @@ impl L2Learner {
         info!("{:.2}h train {} samples", 
                     CoarseInstant::recent().as_secs() as f32 / 3600.0, self.n_curr_train_samples, ); 
 
-        // println!("        y    offline_y     req_rate  write_rate  miss  n_item live_byte  age    create_hour   merge  req    active");  
-        // for i in 0..20 {
-        //     println!("{:12.4} {:12.4} [{:8.2} {:8.2} {:8.2} {:8.0} {:8.0} {:8.0} {:8.0} {:8.0} {:6.0} {:6.0}]", 
-        //         self.train_y[i], self.offline_y[i], 
-        //         self.train_x[i*N_FEATURES], 
-        //         self.train_x[i*N_FEATURES + 1], 
-        //         self.train_x[i*N_FEATURES + 2], 
-        //         self.train_x[i*N_FEATURES + 3], 
-        //         self.train_x[i*N_FEATURES + 4], 
-        //         self.train_x[i*N_FEATURES + 5], 
-        //         self.train_x[i*N_FEATURES + 6], 
-        //         self.train_x[i*N_FEATURES + 7], 
-        //         self.train_x[i*N_FEATURES + 8], 
-        //         self.train_x[i*N_FEATURES + 9], 
-        //     );
-        // }
-
-        // self.normalize_train_y();
-        // self.cap_train_y(); 
-
         // convert train data into XGBoost's matrix format
         let n_row = self.n_curr_train_samples as usize / 10 * 9;
         let mut dtrain = DMatrix::from_dense(&self.train_x[.. n_row * N_FEATURES], n_row).unwrap();
@@ -290,6 +262,15 @@ impl L2Learner {
             .evaluation_sets(Some(&evaluation_sets))  // optional datasets to evaluate against in each iteration
             .build().unwrap();
         
+        for i in 0..n_row_valid {
+            data.push(&(self.training_set[i]).to_vector(), &self.train_y[n_row..n_row+n_row_valid]);
+        }
+
+        // TRAINING
+        self.model.learning_rate(LEARNING_RATE)
+            .activation(Tanh)
+            .train(&data, EPOCH);
+
         // train model, and print evaluation data
         self.bst = Some(Booster::train(&params).unwrap());
 
@@ -302,14 +283,6 @@ impl L2Learner {
             self.n_inference,
             self.total_inference_micros / std::cmp::max(self.n_inference, 1) as u128,
         ); 
-
-        // save model to file
-        // self.bst.save("xgb.model").unwrap();
-        // self.bst = Booster::load("xgb.model").unwrap();
-
-        // save data 
-        // dtrain.save("dtrain.dmat").unwrap();
-        // let dtrain = DMatrix::load("dtrain.dmat").unwrap();
     }
 
 
@@ -320,10 +293,10 @@ impl L2Learner {
         for idx in 0..headers.len() {
             gen_x_from_header(&headers[idx], &mut self.inference_x, idx);
         }
-        let inf_dmatrix = DMatrix::from_dense(&self.inference_x, headers.len()).unwrap(); 
+        // let inf_dmatrix = DMatrix::from_dense(&self.inference_x, headers.len()).unwrap(); 
 
         // predict
-        let preds = self.bst.as_ref().unwrap().predict(&inf_dmatrix).unwrap();
+        let preds = self.model.calc(&mut self.inference_x);
 
         // copy predicted segment utility to headers 
         for (idx, pred_utility) in preds.iter().enumerate() {

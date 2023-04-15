@@ -182,25 +182,17 @@ impl<'a> Iterator for IterMut<'a> {
         );
 
         // get Flash data
-        let idx = flash_bucket_size() * (self.state.bucket_id) + self.state.item_slot * 8;
-        let item_info: &mut u64 = unsafe {
-            std::mem::transmute(&mut self.hashtable.data_flash.as_mut_slice()[idx])
+        let ptr: &mut [u64] = unsafe {
+            std::mem::transmute(self.hashtable.data_flash.as_mut_slice())
         };
+        let item_info = &mut ptr[self.state.bucket_id * 8 + self.state.item_slot]; 
 
         // update iter state
         if self.state.item_slot < n_item_slot - 1 {
             self.state.item_slot += 1;
         } else {
             // finished iterating in this bucket, see if it's chained
-            if self.state.chain_idx < self.state.chain_len {
-                self.state.chain_idx += 1;
-                self.state.item_slot = 0;
-                let bucket = self.hashtable.get_bucket_flash(self.state.bucket_id);
-                let next_bucket_id = *(bucket.data.get(N_BUCKET_SLOT - 1).unwrap()) as usize;
-                self.state.bucket_id = next_bucket_id;
-            } else {
-                self.state.finished = true;
-            }
+            self.state.finished = true;
         }
 
         Some(item_info)
@@ -324,13 +316,11 @@ impl HashTable {
         let tag_exists = self.check_reduced_tag(key);
 
         let iter = IterMut::new(self, hash);
-        let mut iter_times = 0;
-        for current_info in iter {
-            if iter_times > 0 && tag_exists.is_none() {
+        for (i, current_info) in iter.enumerate() {
+            if i > 0 && tag_exists.is_none() {
                 return None;
-            } else if let Some(i) = tag_exists {
-                if iter_times < i {
-                    iter_times += 1;
+            } else if let Some(idx) = tag_exists {
+                if idx < i {
                     continue;
                 }
             }
@@ -359,7 +349,6 @@ impl HashTable {
                     return Some(item);
                 }
             }
-            iter_times += 1;
         }
 
         None
@@ -462,41 +451,44 @@ impl HashTable {
 
         let iter = IterMut::new(self, hash);
 
-        let mut iter_time = 0;
         // iter the current PrimaryHashBucket to see if there's blank slot
-        for item_info in iter {
+        for (i, item_info) in iter.enumerate() {
             if get_tag(*item_info) != tag {
                 if insert_item_info != 0 && *item_info == 0 {
                     // found a blank slot
                     *item_info = insert_item_info;
                     insert_item_info = 0;
+
+                    if i > 0 {
+                        let x = &mut self.data[bucket_id].data[2];
+                        // clear the original tag
+                        *x &= !(0xff << (i-1)*8);
+                        // add current tag
+                        *x |= ((tag >> 52) & 0xff) << (i-1)*8;
+                    }
+
                     break;
                 } else {
                     // item already exists
-                    iter_time += 1;
                     continue;
                 }
             } else {
-                if segments.get_item(*item_info).unwrap().key() != item.key() {
-                    iter_time += 1;
-                } else {
+                if segments.get_item(*item_info).unwrap().key() == item.key() {
                     // update existing key
                     removed = Some(*item_info);
                     *item_info = insert_item_info;
                     insert_item_info = 0;
+
+                    if i > 0 {
+                        let x = &mut self.data[bucket_id].data[2];
+                        // clear the original tag
+                        *x &= !(0xff << (i-1)*8);
+                        // add current tag
+                        *x |= ((tag >> 52) & 0xff) << (i-1)*8;
+                    }
                     break;
                 }
             }
-        }
-
-        // Add reduced tag bits
-        // we don't want to record the first DRAM slot
-        if iter_time > 0 && insert_item_info == 0 {
-            let x = &mut self.data[bucket_id].data[2];
-            // clear the original tag
-            *x &= !(0xff << (iter_time-1)*8);
-            // add current tag
-            *x |= ((tag >> 52) & 0xff) << (iter_time-1)*8;
         }
 
         if let Some(removed_item) = removed {
@@ -646,18 +638,15 @@ impl HashTable {
 
         let iter = IterMut::new(self, hash);
 
-        let mut iter_time = 0;
-        for item_info in iter {
+        for (i, item_info) in iter.enumerate() {
             let current_item_info = clear_freq(*item_info);
             if get_tag(current_item_info) != tag {
-                iter_time += 1;
                 continue;
             }
 
             if get_seg_id(current_item_info) != Some(segment.id())
                 || get_offset(current_item_info) != offset as u64
             {
-                iter_time += 1;
                 continue;
             }
 
@@ -665,9 +654,9 @@ impl HashTable {
                 segment.remove_item(current_item_info, false);
                 *item_info = 0;
 
-                if iter_time > 0 {
+                if i > 0 {
                     let bucket_id = (hash & self.mask) as usize;
-                    self.data[bucket_id].data[2] &= !(0xff << (iter_time-1)*8);
+                    self.data[bucket_id].data[2] &= !(0xff << (i-1)*8);
                 }
                 return true;
             }

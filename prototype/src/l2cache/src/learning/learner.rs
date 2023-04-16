@@ -1,30 +1,27 @@
 
 
 use crate::segments::*;
-use xgboost::{parameters, DMatrix, Booster};
-use neuroflow::FeedForward;
-use neuroflow::activators::Type::Tanh;
-use neuroflow::data::{DataSet, Extractable};
+use rusty_machine::learning::nnet::{NeuralNet, BCECriterion};
+use rusty_machine::learning::toolkit::regularization::Regularization;
+use rusty_machine::learning::optim::grad_desc::AdaGrad;
+
+use rusty_machine::linalg::Matrix;
+use rusty_machine::learning::SupModel;
 
 use crate::*;
-use log::{info, warn};
 use std::time::Instant;
 
 const N_TRAINING_SAMPLES: usize = 8192 * 2;
 const N_FEATURES: usize = 10; 
-const N_TRAIN_ITER: u32 = 8;
-
-// const APPROX_AGE_SHIFT: usize = 2;
-// const APPROX_SIZE_SHIFT: usize = 2;
 
 
 pub struct L2Learner {
     pub has_training_data: bool, 
     pub next_train_time: u32, 
 
-    train_x: Vec<f32>,
-    train_y: Vec<f32>,
-    offline_y: Vec<f32>,
+    train_x: Vec<f64>,
+    train_y: Vec<f64>,
+    offline_y: Vec<f64>,
     approx_snapshot_time: Vec<u32>,
 
     n_obj_since_snapshot: Vec<u16>,
@@ -41,28 +38,27 @@ pub struct L2Learner {
 
     n_curr_train_samples: usize,
 
-    inference_x: Vec<f32>,
+    inference_x: Vec<f64>,
 
-    // bst: Option<Booster>, 
-    bst: Option<FeedForward>,
+    nn: NeuralNet<BCECriterion, AdaGrad>,
 }
 
-fn gen_x_from_header(header: &SegmentHeader, base_x: &mut [f32], idx: usize) {
+fn gen_x_from_header(header: &SegmentHeader, base_x: &mut [f64], idx: usize) {
 
     let start_idx = idx * N_FEATURES;
     let end_idx = start_idx + N_FEATURES;
-    let x: &mut [f32] = &mut base_x[start_idx..end_idx];
+    let x: &mut [f64] = &mut base_x[start_idx..end_idx];
 
-    x[0] = header.req_rate;
-    x[1] = header.write_rate;
-    x[2] = header.miss_ratio;
-    x[3] = header.live_items as f32;
-    x[4] = header.live_bytes as f32;
-    x[5] = (CoarseInstant::recent().as_secs() - header.create_at().as_secs()) as f32;
-    x[6] = ((header.create_at().as_secs() / 3600) % 24) as f32;
-    x[7] = header.n_merge as f32;
-    x[8] = header.n_req as f32;
-    x[9] = header.n_active as f32;
+    x[0] = header.req_rate as f64;
+    x[1] = header.write_rate as f64;
+    x[2] = header.miss_ratio as f64;
+    x[3] = header.live_items as f64;
+    x[4] = header.live_bytes as f64;
+    x[5] = (CoarseInstant::recent().as_secs() - header.create_at().as_secs()) as f64;
+    x[6] = ((header.create_at().as_secs() / 3600) % 24) as f64;
+    x[7] = header.n_merge as f64;
+    x[8] = header.n_req as f64;
+    x[9] = header.n_active as f64;
 }
 
 
@@ -74,6 +70,10 @@ impl L2Learner {
         let approx_snapshot_time = vec![0; N_TRAINING_SAMPLES];
         let n_obj_since_snapshot = vec![0; N_TRAINING_SAMPLES];
         let n_obj_retain_per_seg = vec![0; N_TRAINING_SAMPLES];
+
+        let net: NeuralNet<BCECriterion, AdaGrad> = 
+        NeuralNet::mlp(&[N_FEATURES, 5, 1], BCECriterion::new(Regularization::L2(0.0015)),
+        AdaGrad::new(0.5, 1.5, 70), rusty_machine::learning::toolkit::activ_fn::Linear);
 
         L2Learner {
             has_training_data: false,
@@ -97,7 +97,7 @@ impl L2Learner {
 
             inference_x: vec![0.0; N_FEATURES * n_seg],
 
-            bst: None,
+            nn: net,
         }
     }
 
@@ -111,7 +111,6 @@ impl L2Learner {
 
         header.snapshot_time = CoarseInstant::recent().as_secs() as i32;
         self.n_obj_retain_per_seg[self.n_curr_train_samples] = (header.live_items() / self.n_merge as i32) as u16;
-        // self.approx_snapshot_time[self.n_curr_train_samples] = CoarseInstant::recent().as_secs() >> APPROX_AGE_SHIFT;
         self.approx_snapshot_time[self.n_curr_train_samples] = curr_vtime as u32;
 
         // record the index in the training matrix so that we can update y later
@@ -131,8 +130,6 @@ impl L2Learner {
 
     pub fn gen_training_data(&mut self, headers: &mut [SegmentHeader], curr_vtime: u64) {
         self.n_curr_train_samples = 0;
-        // self.n_curr_train_samples /= 2;
-
         let sample_every_n = std::cmp::max(headers.len() / N_TRAINING_SAMPLES, 1);
         let mut v = sample_every_n; 
 
@@ -148,7 +145,7 @@ impl L2Learner {
         }
 
         self.has_training_data = true; 
-        info!("{:.2}h generate training data", CoarseInstant::recent().as_secs() as f32 / 3600.0);
+        debug!("{:.2}h generate training data", CoarseInstant::recent().as_secs() as f64 / 3600.0);
     }
 
     pub fn accu_train_segment_utility(&mut self, idx: i32, size: u32, curr_vtime: u64) {
@@ -157,57 +154,20 @@ impl L2Learner {
             return;
         }
 
-        // let approx_age = (CoarseInstant::recent().as_secs() >> APPROX_AGE_SHIFT) - self.approx_snapshot_time[idx as usize] + 1;
-        // let approx_size = (size >> APPROX_SIZE_SHIFT) + 1; 
-        // let utility = 1.0e4 / approx_age as f32 / approx_size as f32;
-
-
         let approx_age = curr_vtime as u32 - self.approx_snapshot_time[idx as usize] + 1;
-        // let approx_age = ((curr_vtime as u32 - self.approx_snapshot_time[idx as usize] + 1) as f32).log2() + 1.0;
         let approx_size = size; 
-        let utility = 1.0e8 / approx_age as f32 / approx_size as f32;
+        let utility = 1.0e8 / approx_age as f64 / approx_size as f64;
 
-        assert!(utility < f32::MAX / 2.0, "{} {} {}", approx_age, approx_size, curr_vtime as u32 - self.approx_snapshot_time[idx as usize]);
+        assert!(utility < f64::MAX / 2.0, "{} {} {}", approx_age, approx_size, curr_vtime as u32 - self.approx_snapshot_time[idx as usize]);
         self.train_y[idx as usize] += utility;
     }
 
-    pub fn set_train_segment_utility(&mut self, idx: i32, utility: f32) {
+    pub fn set_train_segment_utility(&mut self, idx: i32, utility: f64) {
         self.train_y[idx as usize] = utility;
     }
 
-    pub fn set_offline_segment_utility(&mut self, idx: i32, utility: f32) {
+    pub fn set_offline_segment_utility(&mut self, idx: i32, utility: f64) {
         self.offline_y[idx as usize] = utility;
-    }
-
-    #[allow(dead_code)]
-    fn normalize_train_y(&mut self) {
-        // normalize training data Y 
-        let max_y = *self.train_y.iter().max_by(|x, y| x.partial_cmp(&y).unwrap()).unwrap();
-        let min_y = *self.train_y.iter().max_by(|x, y| y.partial_cmp(&x).unwrap()).unwrap();
-
-        if max_y - min_y < 1e-8 {
-            warn!("[WARN] max_y ({}) - min_y ({}) < 1e-8", max_y, min_y);
-            return;
-        }
-
-        for i in 0..self.n_curr_train_samples {
-            self.train_y[i] = (self.train_y[i] - min_y) / (max_y - min_y);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn cap_train_y(&mut self) {
-        let mut sorted_train_y = self.train_y.to_vec(); 
-        sorted_train_y.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let y_cap = sorted_train_y[(sorted_train_y.len() as usize) * 9 / 10 - 1];
-        // println!("{:?}", sorted_train_y); 
-        // println!("{:?}", y_cap);
-
-        for i in 0..self.n_curr_train_samples {
-            if self.train_y[i] > y_cap {
-                self.train_y[i] = y_cap;
-            }
-        }
     }
 
     pub fn train(&mut self) {
@@ -218,92 +178,31 @@ impl L2Learner {
         let start_time = Instant::now();
 
 
-        info!("{:.2}h train {} samples", 
-                    CoarseInstant::recent().as_secs() as f32 / 3600.0, self.n_curr_train_samples, ); 
-
-        // convert train data into XGBoost's matrix format
-        let n_row = self.n_curr_train_samples as usize / 10 * 9;
-        let mut dtrain = DMatrix::from_dense(&self.train_x[.. n_row * N_FEATURES], n_row).unwrap();
-        dtrain.set_labels(&self.train_y[..n_row]).unwrap();
-        
-        // validation data
-        let n_row_valid = self.n_curr_train_samples as usize - n_row; 
-        let start = n_row * N_FEATURES;
-        let end = (n_row + n_row_valid) * N_FEATURES;
-        let mut dvalid = DMatrix::from_dense(&self.train_x[start..end], n_row_valid).unwrap();
-        dvalid.set_labels(&self.train_y[n_row..n_row+n_row_valid]).unwrap();
-
-        // configure objectives, metrics, etc.
-        let learning_params = parameters::learning::LearningTaskParametersBuilder::default()
-            .objective(parameters::learning::Objective::RegSquareError)
-            .build().unwrap();
-
-        // configure the tree-based learning model's parameters
-        let tree_params = parameters::tree::TreeBoosterParametersBuilder::default()
-                // .max_depth(32)
-                // .eta(1.0)
-                .build().unwrap();
-
-        // overall configuration for Booster
-        let booster_params = parameters::BoosterParametersBuilder::default()
-            .booster_type(parameters::BoosterType::Tree(tree_params))
-            .learning_params(learning_params)
-            .verbose(false)
-            .build().unwrap();
-
-        // specify datasets to evaluate against during train
-        let evaluation_sets = [(&dtrain, "train"), (&dvalid, "valid"),];
-
-        // overall configuration for train/evaluation
-        let params = parameters::TrainingParametersBuilder::default()
-            .dtrain(&dtrain)                         // dataset to train with
-            .boost_rounds(N_TRAIN_ITER)              // number of train iterations
-            .booster_params(booster_params)          // model parameters
-            .evaluation_sets(Some(&evaluation_sets))  // optional datasets to evaluate against in each iteration
-            .build().unwrap();
-        
-        for i in 0..n_row_valid {
-            data.push(&(self.training_set[i]).to_vector(), &self.train_y[n_row..n_row+n_row_valid]);
-        }
-
-        // TRAINING
-        self.model.learning_rate(LEARNING_RATE)
-            .activation(Tanh)
-            .train(&data, EPOCH);
-
-        // train model, and print evaluation data
-        self.bst = Some(Booster::train(&params).unwrap());
+        let inputs = Matrix::new(self.n_curr_train_samples, N_FEATURES, &self.train_x[..self.n_curr_train_samples*N_FEATURES]);
+        let targets = Matrix::new(self.n_curr_train_samples, 1, &self.train_y[..self.n_curr_train_samples]);    
+    
+        let _ = self.nn.train(&inputs, &targets);
 
         let elapsed = start_time.elapsed().as_micros();
         self.total_train_micros += elapsed;
         self.n_training += 1; 
-        info!("{} training {} micros per training, {} inference {} micros", 
-            self.n_training, 
-            self.total_train_micros / self.n_training as u128,
-            self.n_inference,
-            self.total_inference_micros / std::cmp::max(self.n_inference, 1) as u128,
-        ); 
     }
 
 
     pub fn inference(&mut self, headers: &mut [SegmentHeader]) {
         let start_time = Instant::now();
 
-        // copy from headers to inference_x
         for idx in 0..headers.len() {
             gen_x_from_header(&headers[idx], &mut self.inference_x, idx);
         }
-        // let inf_dmatrix = DMatrix::from_dense(&self.inference_x, headers.len()).unwrap(); 
 
-        // predict
-        let preds = self.model.calc(&mut self.inference_x);
-
-        // copy predicted segment utility to headers 
-        for (idx, pred_utility) in preds.iter().enumerate() {
+        let inputs = Matrix::new(headers.len(), N_FEATURES, self.inference_x.as_slice());
+        let preds = self.nn.predict(&inputs).unwrap();
+        for (idx, pred_utility) in preds.into_vec().iter().enumerate() {
             if headers[idx].next_seg().is_none() {
                 headers[idx].pred_utility = 1.0e8;
             } else {
-                headers[idx].pred_utility = *pred_utility;
+                headers[idx].pred_utility = *pred_utility as f32;
             }
         }
 

@@ -57,14 +57,10 @@ byteorder = "1.4"
 lazy_static = "1.3.0"
 backtrace = "0.3.63"
 smallvec = "1.6.0"
-xgboost = {git = "https://github.com/1a1a11a/rust-xgboost", rev = "360af10" }
 fastrand = "1.7.0"
 log = { version = "0.4.16", features = ["max_level_info", "release_max_level_info"]}
 
-# xgboost-sys = {git = "https://github.com/1a1a11a/rust-xgboost"}
-# xgboost = {version = "0.2.0"}
-
-neuroflow = "0.1.3"
+rusty-machine = { git = "https://github.com/AtheMathmo/rusty-machine.git" }
 
 [dev-dependencies]
 criterion = "0.3.4"

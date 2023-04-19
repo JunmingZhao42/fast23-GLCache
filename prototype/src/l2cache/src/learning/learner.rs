@@ -1,11 +1,10 @@
 
 
 use crate::segments::*;
-use rusty_machine::learning::nnet::{NeuralNet, BCECriterion};
-use rusty_machine::learning::toolkit::regularization::Regularization;
-use rusty_machine::learning::optim::grad_desc::AdaGrad;
+use rusty_machine::learning::lin_reg::LinRegressor;
 
 use rusty_machine::linalg::Matrix;
+use rusty_machine::linalg::Vector;
 use rusty_machine::learning::SupModel;
 
 use crate::*;
@@ -40,7 +39,7 @@ pub struct L2Learner {
 
     inference_x: Vec<f64>,
 
-    nn: NeuralNet<BCECriterion, AdaGrad>,
+    model: LinRegressor,
 }
 
 fn gen_x_from_header(header: &SegmentHeader, base_x: &mut [f64], idx: usize) {
@@ -71,10 +70,6 @@ impl L2Learner {
         let n_obj_since_snapshot = vec![0; N_TRAINING_SAMPLES];
         let n_obj_retain_per_seg = vec![0; N_TRAINING_SAMPLES];
 
-        let net: NeuralNet<BCECriterion, AdaGrad> = 
-        NeuralNet::mlp(&[N_FEATURES, 5, 1], BCECriterion::new(Regularization::L2(0.0015)),
-        AdaGrad::new(0.5, 1.5, 70), rusty_machine::learning::toolkit::activ_fn::Linear);
-
         L2Learner {
             has_training_data: false,
             next_train_time: 0,
@@ -97,7 +92,7 @@ impl L2Learner {
 
             inference_x: vec![0.0; N_FEATURES * n_seg],
 
-            nn: net,
+            model: LinRegressor::default(),
         }
     }
 
@@ -179,9 +174,9 @@ impl L2Learner {
 
 
         let inputs = Matrix::new(self.n_curr_train_samples, N_FEATURES, &self.train_x[..self.n_curr_train_samples*N_FEATURES]);
-        let targets = Matrix::new(self.n_curr_train_samples, 1, &self.train_y[..self.n_curr_train_samples]);    
+        let targets = Vector::new(&self.train_y[..self.n_curr_train_samples]);    
     
-        let _ = self.nn.train(&inputs, &targets);
+        let _ = self.model.train(&inputs, &targets);
 
         let elapsed = start_time.elapsed().as_micros();
         self.total_train_micros += elapsed;
@@ -197,8 +192,14 @@ impl L2Learner {
         }
 
         let inputs = Matrix::new(headers.len(), N_FEATURES, self.inference_x.as_slice());
-        let preds = self.nn.predict(&inputs).unwrap();
-        for (idx, pred_utility) in preds.into_vec().iter().enumerate() {
+        let preds = self.model.predict(&inputs);
+        
+        // Model might not be trained (why?)
+        if preds.is_err() {
+            return;
+        }
+
+        for (idx, pred_utility) in preds.unwrap().into_vec().iter().enumerate() {
             if headers[idx].next_seg().is_none() {
                 headers[idx].pred_utility = 1.0e8;
             } else {

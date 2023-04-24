@@ -7,11 +7,14 @@
 use crate::*;
 use std::path::Path;
 
+const HEAP_PATH: &str = "/mnt/pmem1.0/junming/";
+
 /// A builder that is used to construct a new [`Seg`] instance.
 pub struct Builder {
     hash_power: u8,
     overflow_factor: f64,
     segments_builder: SegmentsBuilder,
+    segments_builder2: SegmentsBuilder,
 }
 
 // Defines the default parameters
@@ -21,6 +24,7 @@ impl Default for Builder {
             hash_power: 16,
             overflow_factor: 0.0,
             segments_builder: SegmentsBuilder::default(),
+            segments_builder2: SegmentsBuilder::default(),
         }
     }
 }
@@ -94,6 +98,11 @@ impl Builder {
         self
     }
 
+    pub fn heap_size2(mut self, bytes: usize) -> Self {
+        self.segments_builder2 = self.segments_builder2.heap_size(bytes);
+        self
+    }
+
     /// Specify the segment size for item storage. The largest item which can be
     /// held is `size - 5` bytes for builds without the `debug` or `magic` build
     /// features enabled. Smaller segment sizes reduce the number of items which
@@ -117,6 +126,11 @@ impl Builder {
         self
     }
 
+    pub fn segment_size2(mut self, size: i32) -> Self {
+        self.segments_builder2 = self.segments_builder2.segment_size(size);
+        self
+    }
+
     /// Specify the eviction policy to be used. See the `Policy` documentation
     /// for more details about each strategy.
     ///
@@ -135,6 +149,11 @@ impl Builder {
         self
     }
 
+    pub fn eviction2(mut self, policy: Policy) -> Self {
+        self.segments_builder2 = self.segments_builder2.eviction_policy(policy);
+        self
+    }
+
     /// Specify a backing file to be used for segment storage.
     ///
     /// # Panics
@@ -142,6 +161,20 @@ impl Builder {
     /// This will panic if the file already exists
     pub fn datapool_path<T: AsRef<Path>>(mut self, path: Option<T>) -> Self {
         self.segments_builder = self.segments_builder.datapool_path(path);
+        self
+    }
+
+    // for now just fix this datapool path
+    pub fn datapool_path2<T: AsRef<Path>>(mut self) -> Self {
+        self.segments_builder2 = self.segments_builder2.datapool_path(Some(&HEAP_PATH));
+        self
+    }
+
+    /// Set start index of segments in the first component
+    /// 0 for default
+    /// prev_segments.segments if ssd
+    pub fn start_idx(mut self, start_idx: u32) -> Self {
+        self.segments_builder = self.segments_builder.start_idx(start_idx);
         self
     }
 
@@ -161,11 +194,13 @@ impl Builder {
     pub fn build(self) -> Seg {
         let hashtable = HashTable::new(self.hash_power, self.overflow_factor);
         let segments = self.segments_builder.build();
+        let segments2 = self.segments_builder2.start_idx(segments.get_capacity()).build();
         let ttl_buckets = TtlBuckets::default();
 
         Seg {
             hashtable,
             segments,
+            segments2,
             ttl_buckets,
         }
     }

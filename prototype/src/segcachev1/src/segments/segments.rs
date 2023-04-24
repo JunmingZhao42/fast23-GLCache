@@ -31,6 +31,7 @@ pub(crate) struct Segments {
     flush_at: CoarseInstant,
     /// Eviction configuration and state
     evict: Box<Eviction>,
+    start_idx: u32,
 }
 
 impl Segments {
@@ -58,7 +59,7 @@ impl Segments {
         headers.reserve_exact(segments);
         for id in 0..segments {
             // safety: we start iterating from 1 and seg id is constrained to < 2^24
-            let header = SegmentHeader::new(unsafe { NonZeroU32::new_unchecked(id as u32 + 1) });
+            let header = SegmentHeader::new(unsafe { NonZeroU32::new_unchecked(id as u32 + 1 + builder.start_idx) });
             headers.push(header);
         }
         let mut headers = headers.into_boxed_slice();
@@ -82,22 +83,27 @@ impl Segments {
                 Segment::from_raw_parts(&mut headers[idx], &mut data.as_mut_slice()[begin..end]);
             segment.init();
 
-            let id = idx as u32 + 1; // we index segments from 1
+            // let id = idx as u32 + 1; // we index segments from 1
+            let id = idx as u32 + 1 + builder.start_idx;
             segment.set_prev_seg(NonZeroU32::new(id - 1));
-            if id < segments as u32 {
+            if id < segments as u32 + builder.start_idx {
                 segment.set_next_seg(NonZeroU32::new(id + 1));
             }
         }
+
+        info!("Heap size (byte): {}", heap_size);
+        info!("Evict policy: {:?} \n", evict_policy);
 
         Self {
             headers,
             segment_size,
             cap: segments as u32,
             free: segments as u32,
-            free_q: NonZeroU32::new(1),
+            free_q: NonZeroU32::new(1 + builder.start_idx),
             data,
             flush_at: Instant::recent(),
-            evict: Box::new(Eviction::new(segments, evict_policy)),
+            evict: Box::new(Eviction::new(segments, evict_policy, builder.start_idx)),
+            start_idx: builder.start_idx,
         }
     }
 
@@ -116,6 +122,22 @@ impl Segments {
     /// Returns the time the segments were last flushed
     pub fn flush_at(&self) -> CoarseInstant {
         self.flush_at
+    }
+
+    /// check if the given segment_id is valid in this Segments
+    pub fn seg_id_valid(&self, seg_id: NonZeroU32) -> bool {
+        (seg_id.get() > self.start_idx) &&
+        (seg_id.get() <= self.cap + self.start_idx)
+    }
+
+    /// check if it's DRAM_Segments by looking at start_index
+    #[inline]
+    pub fn is_dram(&self) -> bool {
+        self.start_idx == 0
+    }    
+
+    pub fn get_capacity(&self) -> u32 {
+        self.cap
     }
 
     /// Retrieve a `RawItem` from the segment id and offset encoded in the
@@ -171,41 +193,17 @@ impl Segments {
     /// Perform eviction based on the configured eviction policy. A success from
     /// this function indicates that a segment was put onto the free queue and
     /// that `pop_free()` should return some segment id.
+    /// NOTE: should only be called by the segments2
     pub fn evict(
         &mut self,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &mut HashTable,
     ) -> Result<(), SegmentsError> {
+        assert!(!self.is_dram(), "DRAM_Segments should not call evict");
+
         match self.evict.policy() {
             Policy::Merge { .. } => {
-
-                let mut seg_idx = self.evict.random();
-
-                seg_idx %= self.cap;
-                let ttl = self.headers[seg_idx as usize].ttl();
-                let offset = ttl_buckets.get_bucket_index(ttl);
-                let buckets = ttl_buckets.buckets.len();
-
-                // since merging starts in the middle of a segment chain, we may
-                // need to loop back around to the first ttl bucket we checked
-                for i in 0..=buckets * 2 {
-                    let bucket_id = (offset + i) % buckets;
-                    let ttl_bucket = &mut ttl_buckets.buckets[bucket_id];
-                    if let Some(first_seg) = ttl_bucket.head() {
-                        let start = ttl_bucket.next_to_merge().unwrap_or(first_seg);
-                        match self.merge_evict(start, hashtable) {
-                            Ok(next_to_merge) => {
-                                debug!("merged ttl_bucket: {} seg: {}", bucket_id, start);
-                                ttl_bucket.set_next_to_merge(next_to_merge);
-                                return Ok(());
-                            }
-                            Err(_) => {
-                                ttl_bucket.set_next_to_merge(None);
-                                continue;
-                            }
-                        }
-                    }
-                }
+                assert!(false, "Merge policy not supported");
                 Err(SegmentsError::NoEvictableSegments)
             }
             Policy::None => Err(SegmentsError::NoEvictableSegments),
@@ -247,89 +245,35 @@ impl Segments {
         }
     }
 
-    /// Gets a mutable `Segment` view for two segments after making sure the
-    /// borrows are disjoint.
-    pub(crate) fn get_mut_pair(
-        &mut self,
-        a: NonZeroU32,
-        b: NonZeroU32,
-    ) -> Result<(Segment, Segment), SegmentsError> {
-        if a == b {
-            Err(SegmentsError::BadSegmentId)
-        } else {
-            let a = a.get() as usize - 1;
-            let b = b.get() as usize - 1;
-            if a >= self.headers.len() || b >= self.headers.len() {
-                return Err(SegmentsError::BadSegmentId);
-            }
-            // we have already guaranteed that 'a' and 'b' are not the same, so
-            // we know that they are disjoint borrows and can safely return
-            // mutable borrows to both the segments
-            unsafe {
-                let seg_size = self.segment_size() as usize;
-
-                let header_a = &mut self.headers[a] as *mut _;
-                let header_b = &mut self.headers[b] as *mut _;
-
-                let data = self.data.as_mut_slice();
-
-                // split the borrowed data
-                let split = (std::cmp::min(a, b) + 1) * seg_size;
-                let (first, second) = data.split_at_mut(split);
-
-                let (data_a, data_b) = if a < b {
-                    let start_a = seg_size * a;
-                    let end_a = seg_size * (a + 1);
-
-                    let start_b = (seg_size * b) - first.len();
-                    let end_b = (seg_size * (b + 1)) - first.len();
-
-                    (&mut first[start_a..end_a], &mut second[start_b..end_b])
-                } else {
-                    let start_a = (seg_size * a) - first.len();
-                    let end_a = (seg_size * (a + 1)) - first.len();
-
-                    let start_b = seg_size * b;
-                    let end_b = seg_size * (b + 1);
-
-                    (&mut second[start_a..end_a], &mut first[start_b..end_b])
-                };
-
-                let segment_a = Segment::from_raw_parts(&mut *header_a, data_a);
-                let segment_b = Segment::from_raw_parts(&mut *header_b, data_b);
-
-                segment_a.check_magic();
-                segment_b.check_magic();
-                Ok((segment_a, segment_b))
-            }
-        }
-    }
-
     /// Helper function which unlinks a segment from a chain by updating the
     /// pointers of previous and next segments.
     /// *NOTE*: this function must not be used on segments in the free queue
     fn unlink(&mut self, id: NonZeroU32) {
-        let id_idx = id.get() as usize - 1;
+        assert!(self.seg_id_valid(id));
+        let id_idx = (id.get() - 1 - self.start_idx) as usize;
 
         if let Some(next) = self.headers[id_idx].next_seg() {
             let prev = self.headers[id_idx].prev_seg();
-            self.headers[next.get() as usize - 1].set_prev_seg(prev);
+            self.headers[(next.get() - 1 - self.start_idx) as usize].set_prev_seg(prev);
         }
 
         if let Some(prev) = self.headers[id_idx].prev_seg() {
             let next = self.headers[id_idx].next_seg();
-            self.headers[prev.get() as usize - 1].set_next_seg(next);
+            self.headers[(prev.get() - 1 - self.start_idx) as usize].set_next_seg(next);
         }
     }
 
     /// Helper function which pushes a segment onto the front of a chain.
     fn push_front(&mut self, this: NonZeroU32, head: Option<NonZeroU32>) {
-        let this_idx = this.get() as usize - 1;
+        assert!(self.seg_id_valid(this));
+        let this_idx = (this.get() - 1 - self.start_idx) as usize;
+
         self.headers[this_idx].set_next_seg(head);
         self.headers[this_idx].set_prev_seg(None);
 
         if let Some(head_id) = head {
-            let head_idx = head_id.get() as usize - 1;
+            assert!(self.seg_id_valid(head_id));
+            let head_idx = (head_id.get() - 1 - self.start_idx) as usize;
             debug_assert!(self.headers[head_idx].prev_seg().is_none());
             self.headers[head_idx].set_prev_seg(Some(this));
         }
@@ -345,7 +289,7 @@ impl Segments {
         self.push_front(id, self.free_q);
         self.free_q = Some(id);
 
-        let id_idx = id.get() as usize - 1;
+        let id_idx = (id.get() - 1 - self.start_idx) as usize;
         assert!(!self.headers[id_idx].evictable());
         self.headers[id_idx].set_accessible(false);
 
@@ -367,12 +311,12 @@ impl Segments {
             let id = self.free_q;
             assert!(id.is_some());
 
-            let id_idx = id.unwrap().get() as usize - 1;
+            let id_idx = (id.unwrap().get() - 1 - self.start_idx) as usize;
 
             if let Some(next) = self.headers[id_idx].next_seg() {
                 self.free_q = Some(next);
                 // this is not really necessary
-                let next = &mut self.headers[next.get() as usize - 1];
+                let next = &mut self.headers[(next.get() - 1 - self.start_idx) as usize];
                 next.set_prev_seg(None);
             } else {
                 self.free_q = None;
@@ -417,7 +361,7 @@ impl Segments {
                     let idx = (start + i) % self.cap;
                     if self.headers[idx as usize].can_evict() {
                         // safety: we are always adding 1 to the index
-                        return Some(unsafe { NonZeroU32::new_unchecked(idx + 1) });
+                        return Some(unsafe { NonZeroU32::new_unchecked(idx + 1 + self.start_idx) });
                     }
                 }
 
@@ -439,12 +383,18 @@ impl Segments {
                     if self.headers[idx as usize].accessible() {
                         let ttl = self.headers[idx as usize].ttl();
                         let ttl_bucket = ttl_buckets.get_mut_bucket(ttl);
-                        return ttl_bucket.head();
+                        // head is the oldest
+                        if self.is_dram() {
+                            return ttl_bucket.head(); 
+                        } else {
+                            return ttl_bucket.head2();
+                        }
                     }
                 }
 
                 None
             }
+            // Fifo: first-in-first-out, Cte: closest-to-expiration, Util: least-utilized
             _ => {
                 if self.evict.should_rerank() {
                     self.evict.rerank(&self.headers);
@@ -480,6 +430,7 @@ impl Segments {
 
     /// Remove a single item from a segment based on the segment id and offset.
     /// Optionally, sets the item tombstone.
+    #[allow(unused_variables)]
     pub(crate) fn remove_at(
         &mut self,
         seg_id: NonZeroU32,
@@ -488,6 +439,8 @@ impl Segments {
         ttl_buckets: &mut TtlBuckets,
         hashtable: &mut HashTable,
     ) -> Result<(), SegmentsError> {
+        let is_dram = self.is_dram();
+
         // remove the item
         {
             let mut segment = self.get_mut(seg_id)?;
@@ -502,58 +455,33 @@ impl Segments {
                 // the bucket head while we have access to the ttl buckets
                 if segment.prev_seg().is_none() {
                     let ttl_bucket = ttl_buckets.get_mut_bucket(segment.ttl());
-                    ttl_bucket.set_head(segment.next_seg());
+                    if is_dram  {
+                        ttl_bucket.set_head(segment.next_seg()); 
+                    } else { 
+                        ttl_bucket.set_head2(segment.next_seg());
+                    }
+                    // manually relink the bucket tail
+                    if segment.next_seg().is_none() {
+                        let ttl_bucket = ttl_buckets.get_mut_bucket(segment.ttl());
+                        if is_dram  { ttl_bucket.set_tail(segment.prev_seg()); } else
+                                    { ttl_bucket.set_tail2(segment.prev_seg()); }
+                    }
                 }
                 self.push_free(seg_id);
                 return Ok(());
             }
         }
 
+        // we don't do merge for segments2
+        if !is_dram {
+            return Ok(());
+        }
+
         // for merge eviction, we check if the segment is now below the target
         // ratio which serves as a low watermark for occupancy. if it is, we do
         // a no-evict merge (compaction only, no-pruning)
         if let Policy::Merge { .. } = self.evict.policy() {
-            let target_ratio = self.evict.compact_ratio();
-
-            let id_idx = seg_id.get() as usize - 1;
-
-            let ratio = self.headers[id_idx].live_bytes() as f64 / self.segment_size() as f64;
-
-            // if this segment occupancy is higher than the target ratio, skip
-            // merge
-            if ratio > target_ratio {
-                return Ok(());
-            }
-
-            if let Some(next_id) = self.headers[id_idx].next_seg() {
-                // require that this segment has not merged recently, this
-                // reduces CPU load under heavy rewrite/delete workloads at the
-                // cost of letting more dead items remain in the segements,
-                // reducing the hitrate
-                // if self.headers[seg_id as usize].merge_at() + CoarseDuration::from_secs(30) > CoarseInstant::recent() {
-                //     return Ok(());
-                // }
-
-                let next_idx = next_id.get() as usize - 1;
-
-                // if the next segment can't be evicted, we shouldn't merge
-                if !self.headers[next_idx].can_evict() {
-                    return Ok(());
-                }
-
-                // calculate occupancy ratio of the next segment
-                let next_ratio =
-                    self.headers[next_idx].live_bytes() as f64 / self.segment_size() as f64;
-
-                // if the next segment is empty enough, proceed to merge compaction
-                if next_ratio <= target_ratio {
-                    let _ = self.merge_compact(seg_id, hashtable);
-                    // we need to make sure the ttl bucket doesn't have a pointer to
-                    // any of the segments we removed through merging.
-                    let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
-                    ttl_bucket.set_next_to_merge(None);
-                }
-            }
+            assert!(false, "merge eviction is not supported");
         }
 
         Ok(())
@@ -598,284 +526,120 @@ impl Segments {
         integrity
     }
 
-    fn merge_evict_chain_len(&mut self, start: NonZeroU32) -> usize {
-        let mut len = 0;
-        let mut id = start;
-        let max = self.evict.max_merge();
 
-        while len < max {
-            if let Ok(seg) = self.get_mut(id) {
-                if seg.can_evict() {
-                    len += 1;
-                    match seg.next_seg() {
-                        Some(i) => {
-                            id = i;
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                warn!("invalid segment id: {}", id);
-                break;
-            }
-        }
-
-        len
-    }
-
-    fn merge_compact_chain_len(&mut self, start: NonZeroU32) -> usize {
-        let mut len = 0;
-        let mut id = start;
-        let max = self.evict.max_merge();
-        let mut occupied = 0;
-        let seg_size = self.segment_size();
-
-        while len < max {
-            if let Ok(seg) = self.get_mut(id) {
-                if seg.can_evict() {
-                    occupied += seg.live_bytes();
-                    if occupied > seg_size {
-                        break;
-                    }
-                    len += 1;
-                    match seg.next_seg() {
-                        Some(i) => {
-                            id = i;
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                warn!("invalid segment id: {}", id);
-                break;
-            }
-        }
-
-        len
-    }
-
-    fn merge_evict(
+    pub fn move_seg_into(
         &mut self,
-        start: NonZeroU32,
-        hashtable: &mut HashTable,
-    ) -> Result<Option<NonZeroU32>, SegmentsError> {
+        seg_id: NonZeroU32,
+        ttl_buckets: &mut TtlBuckets,
+        hashtable: &mut HashTable, 
+        other_segs: &mut Segments,
+    ) -> Result<(), SegmentsError> {
+        let to_ssd = !other_segs.is_dram();
 
-        let dst_id = start;
-        let chain_len = self.merge_evict_chain_len(start);
+        // 1. input the least/most valuable from the current segment
+        assert!(self.seg_id_valid(seg_id));
+        let mut old_seg = self.get_mut(seg_id)?;
 
-        // TODO(bmartin): this should be a different error probably
-        if chain_len < 3 {
-            return Err(SegmentsError::NoEvictableSegments);
-        }
-
-        let mut next_id = self.get_mut(start).map(|s| s.next_seg())?;
-
-        // merge state
-        let mut cutoff = 1.0;
-        let mut merged = 0;
-
-        // fixed merge parameters
-        let max_merge = self.evict.max_merge();
-        let n_merge = self.evict.n_merge();
-        let stop_ratio = self.evict.stop_ratio();
-        let stop_bytes = (stop_ratio * self.segment_size() as f64) as i32;
-
-        // dynamically set the target ratio based on the length of the merge chain
-        let target_ratio = if chain_len < n_merge {
-            1.0 / chain_len as f64
-        } else {
-            self.evict.target_ratio()
-        };
-
-        // prune and compact target segment
-        {
-            let mut dst = self.get_mut(start)?;
-            let dst_old_size = dst.live_bytes();
-
-            trace!("prune merge with cutoff: {}", cutoff);
-            cutoff = dst.prune(hashtable, cutoff, target_ratio);
-            trace!("cutoff is now: {}", cutoff);
-
-            dst.compact(hashtable)?;
-
-            let dst_new_size = dst.live_bytes();
-            trace!(
-                "dst {}: {} bytes -> {} bytes",
-                dst_id,
-                dst_old_size,
-                dst_new_size
-            );
-
-            dst.mark_merged();
-            merged += 1;
-        }
-
-        // while we still want to merge and can, we prune and compact the source
-        // and then copy into the destination. If the destination becomes full,
-        // we stop merging
-        while let Some(src_id) = next_id {
-            if merged > max_merge {
-                trace!("stop merge: merged max segments");
-                break;
+        // 2. copy the segment content into the new segment
+        // MY-LATER-TODO: 
+        // current assumption: segment size equals to each other
+        // if not enough, we need to use more than one free from the src segments
+        let ttl = old_seg.ttl();
+        let ttl_bucket = ttl_buckets.get_mut_bucket(ttl);
+        loop {
+            match ttl_bucket.try_expand(other_segs) {
+                Ok(()) => {
+                    // expand segments successful, copy into tail
+                    let ttl_tail = 
+                        if to_ssd {
+                            ttl_bucket.tail2()
+                        } else {
+                            ttl_bucket.tail()
+                        };
+                    if let Some(id) = ttl_tail {
+                        if let Ok(mut tail_seg) = other_segs.get_mut(id) {
+                            if !tail_seg.accessible() {
+                                continue;
+                            }
+                            // copy
+                            if old_seg.copy_into(
+                                &mut tail_seg, 
+                                hashtable
+                            ).is_err() {
+                                return Err(SegmentsError::RelinkFailure);
+                            }
+                            // remove the old-segment from ttl_bucket
+                            // MY-TODO-LATER: this should not be needed
+                            old_seg.clear(hashtable, false);
+                            old_seg.set_accessible(false);
+                            // reset ttl-head
+                            if old_seg.prev_seg().is_none() {
+                                if to_ssd {
+                                    ttl_bucket.set_head(old_seg.next_seg());
+                                } else {
+                                    ttl_bucket.set_head2(old_seg.next_seg());
+                                }
+                            }
+                            // reset ttl-tail
+                            if old_seg.next_seg().is_none() {
+                                if to_ssd {
+                                    ttl_bucket.set_tail(old_seg.prev_seg());
+                                } else {
+                                    ttl_bucket.set_tail2(old_seg.prev_seg());
+                                }
+                            }
+                            self.push_free(seg_id);
+                            return Ok(());
+                        }
+                    }
+                },
+                Err(_) => {
+                    return Err(SegmentsError::NoEvictableSegments);
+                }
             }
-
-            if !self.get_mut(src_id).map(|s| s.can_evict()).unwrap_or(false) {
-                trace!("stop merge: can't evict source segment");
-                return Ok(None); // this causes the next_to_merge to reset
-            }
-
-            let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
-
-            let dst_start_size = dst.live_bytes();
-            let src_start_size = src.live_bytes();
-
-            if dst_start_size >= stop_bytes {
-                trace!("stop merge: target segment is full");
-                break;
-            }
-
-            trace!("pruning source segment");
-            cutoff = src.prune(hashtable, cutoff, target_ratio);
-
-            trace!(
-                "src {}: {} bytes -> {} bytes",
-                src_id,
-                src_start_size,
-                src.live_bytes()
-            );
-
-            trace!("copying source into target");
-            let _ = src.copy_into(&mut dst, hashtable);
-            trace!("copy dropped {} bytes", src.live_bytes());
-
-            trace!(
-                "dst {}: {} bytes -> {} bytes",
-                dst_id,
-                dst_start_size,
-                dst.live_bytes()
-            );
-
-            next_id = src.next_seg();
-            src.clear(hashtable, false);
-            self.push_free(src_id);
-            merged += 1;
         }
-
-        Ok(next_id)
     }
 
-    fn merge_compact(
-        &mut self,
-        start: NonZeroU32,
+    /// Try to demote `count` number of segments from seg1 to seg2
+    /// Should be **only** called by DRAM_Segments
+    pub fn demote(
+        &mut self, 
+        ttl_buckets: &mut TtlBuckets,
         hashtable: &mut HashTable,
-    ) -> Result<Option<NonZeroU32>, SegmentsError> {
+        segments2: &mut Segments,
+        count: usize,
+    ) -> usize {
+        assert!(self.is_dram());
+        assert!(!segments2.is_dram());
 
-        let dst_id = start;
+        match self.evict.policy() {
+            Policy::None => 0,
+            Policy::Merge { .. } => {
+                assert!(false, "Merge demote not suported");
+                0
+            },
+            _ => {
+                let mut demoted = 0;
 
-        let chain_len = self.merge_compact_chain_len(start);
-
-        // TODO(bmartin): this should be a different error probably
-        if chain_len < 2 {
-            return Err(SegmentsError::NoEvictableSegments);
-        }
-
-        let mut next_id = self.get_mut(start).map(|s| s.next_seg())?;
-
-        // TODO(bmartin): this should be a different error probably
-        // TODO(bmartin): maybe not needed with the merge chain len check above
-        if next_id.is_none() {
-            return Err(SegmentsError::NoEvictableSegments);
-        }
-
-        // merge state
-        let mut merged = 0;
-
-        // fixed merge parameters
-        let seg_size = self.segment_size();
-        let max_merge = self.evict.max_merge();
-        let stop_ratio = self.evict.stop_ratio();
-        let stop_bytes = (stop_ratio * self.segment_size() as f64) as i32;
-
-        // prune and compact target segment
-        {
-            let mut dst = self.get_mut(start)?;
-            let dst_old_size = dst.live_bytes();
-
-            dst.compact(hashtable)?;
-
-            let dst_new_size = dst.live_bytes();
-            trace!(
-                "dst {}: {} bytes -> {} bytes",
-                dst_id,
-                dst_old_size,
-                dst_new_size
-            );
-
-            dst.mark_merged();
-            merged += 1;
-        }
-
-        // while we still want to merge and can, we prune and compact the source
-        // and then copy into the destination. If the destination becomes full,
-        // we stop merging
-        while let Some(src_id) = next_id {
-            if merged > max_merge {
-                trace!("stop merge: merged max segments");
-                break;
+                for _ in 0..count {
+                    // select most valuable segment
+                    let most_valuable_seg = self.least_valuable_seg(ttl_buckets);
+                    if let Some(seg_id) = most_valuable_seg {
+                        if self.move_seg_into(
+                            seg_id, 
+                            ttl_buckets,
+                            hashtable,
+                            segments2
+                        ).is_ok() {
+                            // copy into the tail segment of ttl_bucket
+                            debug!("DRAM{} demoted", seg_id.get());
+                            demoted += 1;
+                        }
+                    }            
+                }
+                demoted
             }
-
-            if !self.get_mut(src_id).map(|s| s.can_evict()).unwrap_or(false) {
-                trace!("stop merge: can't evict source segment");
-                return Ok(None); // this causes the next_to_merge to reset
-            }
-
-            let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
-
-            let dst_start_size = dst.live_bytes();
-            let src_start_size = src.live_bytes();
-
-            if dst_start_size >= stop_bytes {
-                trace!("stop merge: target segment is full");
-                break;
-            }
-
-            if dst_start_size + src_start_size > seg_size {
-                break;
-            }
-
-            trace!(
-                "src {}: {} bytes -> {} bytes",
-                src_id,
-                src_start_size,
-                src.live_bytes()
-            );
-
-            trace!("copying source into target");
-            let _ = src.copy_into(&mut dst, hashtable);
-            trace!("copy dropped {} bytes", src.live_bytes());
-
-            trace!(
-                "dst {}: {} bytes -> {} bytes",
-                dst_id,
-                dst_start_size,
-                dst.live_bytes()
-            );
-
-            next_id = src.next_seg();
-            src.clear(hashtable, false);
-            self.push_free(src_id);
-            merged += 1;
         }
-
-        Ok(next_id)
     }
 }
 

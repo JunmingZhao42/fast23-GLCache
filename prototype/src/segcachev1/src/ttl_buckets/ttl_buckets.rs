@@ -105,7 +105,7 @@ impl TtlBuckets {
         unsafe { self.buckets.get_unchecked_mut(index) }
     }
 
-    pub(crate) fn expire(&mut self, hashtable: &mut HashTable, segments: &mut Segments) -> usize {
+    pub(crate) fn expire(&mut self, hashtable: &mut HashTable, segments: &mut Segments, segments2: &mut Segments) -> usize {
         let now = CoarseInstant::now();
 
         if now == self.last_expired {
@@ -118,6 +118,7 @@ impl TtlBuckets {
         let mut expired = 0;
         for bucket in self.buckets.iter_mut() {
             expired += bucket.expire(hashtable, segments);
+            expired += bucket.expire(hashtable, segments2);
         }
         let duration = start.elapsed();
         debug!("expired: {} segments in {:?}", expired, duration);

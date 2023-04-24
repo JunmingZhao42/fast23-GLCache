@@ -7,6 +7,7 @@
 use crate::*;
 
 const RESERVE_RETRIES: usize = 3;
+const DEMOTE_NUM: usize = 1;
 
 /// A pre-allocated key-value store with eager expiration. It uses a
 /// segment-structured design that stores data in fixed-size segments, grouping
@@ -15,6 +16,7 @@ const RESERVE_RETRIES: usize = 3;
 pub struct Seg {
     pub(crate) hashtable: HashTable,
     pub(crate) segments: Segments,
+    pub(crate) segments2: Segments,
     pub(crate) ttl_buckets: TtlBuckets,
 }
 
@@ -51,7 +53,7 @@ impl Seg {
     #[cfg(any(test, feature = "debug"))]
     pub fn items(&mut self) -> usize {
         trace!("getting segment item counts");
-        self.segments.items()
+        self.segments.items() + self.segments2.items()
     }
 
     /// Get the item in the `Seg` with the provided key
@@ -67,7 +69,7 @@ impl Seg {
     /// assert_eq!(item.value(), b"strong");
     /// ```
     pub fn get(&mut self, key: &[u8]) -> Option<Item> {
-        self.hashtable.get(key, &mut self.segments)
+        self.hashtable.get(key, &mut self.segments, &mut self.segments2)
     }
 
     /// Get the item in the `Seg` with the provided key without
@@ -80,7 +82,7 @@ impl Seg {
     /// assert!(cache.get_no_freq_incr(b"coffee").is_none());
     /// ```
     pub fn get_no_freq_incr(&mut self, key: &[u8]) -> Option<Item> {
-        self.hashtable.get_no_freq_incr(key, &mut self.segments)
+        self.hashtable.get_no_freq_incr(key, &mut self.segments, &mut self.segments2)
     }
 
     pub fn insert_with_ns<'a>(
@@ -142,17 +144,26 @@ impl Seg {
                     return Err(SegError::ItemOversized { size, key });
                 }
                 Err(TtlBucketsError::NoFreeSegments) => {
-                    if self
-                        .segments
-                        .evict(&mut self.ttl_buckets, &mut self.hashtable)
-                        .is_err()
-                    {
+                    let evict: Result<(), SegmentsError> = 
+                    if self.segments.demote(
+                        &mut self.ttl_buckets,
+                        &mut self.hashtable,
+                        &mut self.segments2,
+                        DEMOTE_NUM) == 0 { 
+                            Err(SegmentsError::NoEvictableSegments) 
+                        } else {
+                            Ok(()) 
+                        };
+
+                    if evict.is_err() {
+                        let _ = self.segments2.evict(&mut self.ttl_buckets, &mut self.hashtable);
                         retries -= 1;
                     } else {
                         continue;
                     }
                 }
             }
+            // we don't insert into segments2 directly for now
             if retries == 0 {
                 return Err(SegError::NoFreeSegments);
             }
@@ -223,7 +234,7 @@ impl Seg {
         ttl: CoarseDuration,
         cas: u32,
     ) -> Result<(), SegError<'a>> {
-        match self.hashtable.try_update_cas(key, cas, &mut self.segments) {
+        match self.hashtable.try_update_cas(key, cas, &mut self.segments, &mut self.segments2) {
             Ok(()) => self.insert(key, value, optional, ttl),
             Err(e) => Err(e),
         }
@@ -248,7 +259,7 @@ impl Seg {
     // TODO(bmartin): a result would be better here
     pub fn delete(&mut self, key: &[u8]) -> bool {
         self.hashtable
-            .delete(key, &mut self.ttl_buckets, &mut self.segments)
+            .delete(key, &mut self.ttl_buckets, &mut self.segments, &mut self.segments2)
     }
 
     /// Loops through the TTL Buckets to handle eager expiration, returns the
@@ -274,14 +285,14 @@ impl Seg {
     pub fn expire(&mut self) -> usize {
         // rustcommon_time::refresh_clock();
         self.ttl_buckets
-            .expire(&mut self.hashtable, &mut self.segments)
+            .expire(&mut self.hashtable, &mut self.segments, &mut self.segments2)
     }
 
     /// Checks the integrity of all segments
     /// *NOTE*: this operation is relatively expensive
     #[cfg(feature = "debug")]
     pub fn check_integrity(&mut self) -> Result<(), SegError> {
-        if self.segments.check_integrity() {
+        if self.segments.check_integrity() && self.segments2.check_integrity() {
             Ok(())
         } else {
             Err(SegError::DataCorrupted)

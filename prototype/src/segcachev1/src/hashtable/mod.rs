@@ -144,7 +144,7 @@ impl HashTable {
     }
 
     /// Lookup an item by key and return it
-    pub fn get(&mut self, key: &[u8], segments: &mut Segments) -> Option<Item> {
+    pub fn get(&mut self, key: &[u8], segments: &mut Segments, segments2: &mut Segments) -> Option<Item> {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
         let bucket_id = hash & self.mask;
@@ -199,8 +199,17 @@ impl HashTable {
 
                 let current_info = bucket.data[i];
 
+                // MY-TODO: DRAM-first strategy
                 if get_tag(current_info) == tag {
-                    let current_item = segments.get_item(current_info).unwrap();
+                    // Get the item
+                    let seg_id = get_seg_id(current_info).unwrap();
+                    let current_item_op: Option<RawItem> = 
+                        if segments.seg_id_valid(seg_id) {
+                            segments.get_item(current_info)
+                        } else {
+                            segments2.get_item(current_info)
+                        };
+                    let current_item = current_item_op.unwrap();
                     if current_item.key() != key {
                     } else {
                         // update item frequency
@@ -241,7 +250,7 @@ impl HashTable {
     /// Lookup an item by key and return it without incrementing the item
     /// frequency. This may be used to compose higher-level functions which do
     /// not want a successful item lookup to count as a hit for that item.
-    pub fn get_no_freq_incr(&mut self, key: &[u8], segments: &mut Segments) -> Option<Item> {
+    pub fn get_no_freq_incr(&mut self, key: &[u8], segments: &mut Segments, segments2: &mut Segments) -> Option<Item> {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
         let bucket_id = hash & self.mask;
@@ -267,7 +276,14 @@ impl HashTable {
                 let current_info = bucket.data[i];
 
                 if get_tag(current_info) == tag {
-                    let current_item = segments.get_item(current_info).unwrap();
+                    let seg_id = get_seg_id(current_info).unwrap();
+                    let current_item_op: Option<RawItem> = 
+                        if segments.seg_id_valid(seg_id) {
+                            segments.get_item(current_info)
+                        } else {
+                            segments2.get_item(current_info)
+                        };
+                    let current_item = current_item_op.unwrap();
                     if current_item.key() != key {
                     } else {
                         let item = Item::new(
@@ -292,6 +308,7 @@ impl HashTable {
     }
 
     /// Return the frequency for the item with the key
+    #[allow(dead_code)]
     pub fn get_freq(&mut self, key: &[u8], segment: &mut Segment, offset: u64) -> Option<u64> {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
@@ -493,6 +510,7 @@ impl HashTable {
         key: &'a [u8],
         cas: u32,
         segments: &mut Segments,
+        segments2: &mut Segments
     ) -> Result<(), SegError<'a>> {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
@@ -517,7 +535,14 @@ impl HashTable {
                 let current_info = bucket.data[i];
 
                 if get_tag(current_info) == tag {
-                    let current_item = segments.get_item(current_info).unwrap();
+                    let seg_id = get_seg_id(current_info).unwrap();
+                    let current_item_op: Option<RawItem> = 
+                        if segments.seg_id_valid(seg_id) {
+                            segments.get_item(current_info)
+                        } else {
+                            segments2.get_item(current_info)
+                        };
+                    let current_item = current_item_op.unwrap();
                     if current_item.key() != key {
                     } else {
                         // update item frequency
@@ -561,6 +586,7 @@ impl HashTable {
         key: &[u8],
         ttl_buckets: &mut TtlBuckets,
         segments: &mut Segments,
+        segments2: &mut Segments,
     ) -> bool {
         let hash = self.hash(key);
         let tag = tag_from_hash(hash);
@@ -583,12 +609,23 @@ impl HashTable {
                 let current_item_info = self.data[bucket_id].data[i];
 
                 if get_tag(current_item_info) == tag {
-                    let current_item = segments.get_item(current_item_info).unwrap();
+                    let seg_id = get_seg_id(current_item_info).unwrap();
+                    let current_item_op: Option<RawItem> = 
+                        if segments.seg_id_valid(seg_id) {
+                            segments.get_item(current_item_info)
+                        } else {
+                            segments2.get_item(current_item_info)
+                        };
+                    let current_item = current_item_op.unwrap();
                     if current_item.key() != key {
                         continue;
                     } else {
-                        let _ =
-                            segments.remove_item(current_item_info, !deleted, ttl_buckets, self);
+                        let seg_id = get_seg_id(current_item_info).unwrap();
+                        if segments.seg_id_valid(seg_id) {
+                            let _ = segments.remove_item(current_item_info, !deleted, ttl_buckets, self);
+                        } else {
+                            let _ = segments2.remove_item(current_item_info, !deleted, ttl_buckets, self);
+                        };
                         self.data[bucket_id].data[i] = 0;
                         deleted = true;
                     }

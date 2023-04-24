@@ -205,12 +205,6 @@ impl<'a> Segment<'a> {
         self.header.create_at()
     }
 
-    /// Mark that the segment has been merged
-    #[inline]
-    pub fn mark_merged(&mut self) {
-        self.header.mark_merged()
-    }
-
     /// Return the previous segment's id. This will be a segment before it in a
     /// TtlBucket or on the free queue. A `None` indicates that this segment is
     /// the head of a bucket or the free queue.
@@ -316,77 +310,6 @@ impl<'a> Segment<'a> {
         }))
     }
 
-    /// This is used as part of segment merging, it moves all occupied space to
-    /// the beginning of the segment, leaving the end of the segment free
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn compact(&mut self, hashtable: &mut HashTable) -> Result<(), SegmentsError> {
-        let max_offset = self.max_item_offset();
-        let mut read_offset = if cfg!(feature = "magic") {
-            std::mem::size_of_val(&SEG_MAGIC)
-        } else {
-            0
-        };
-
-        let mut write_offset = read_offset;
-
-        while read_offset <= max_offset {
-            let item = self.get_item_at(read_offset).unwrap();
-            if item.klen() == 0 && self.live_items() == 0 {
-                break;
-            }
-
-            item.check_magic();
-
-            let item_size = item.size();
-
-            // don't copy deleted items
-            if item.deleted() {
-                // since the segment won't be cleared, we decrement dead items
-                // move read offset forward, leave write offset trailing
-                read_offset += item_size;
-                continue;
-            }
-
-            // only copy if the offsets are different
-            if read_offset != write_offset {
-                let src = unsafe { self.data.as_ptr().add(read_offset) };
-                let dst = unsafe { self.data.as_mut_ptr().add(write_offset) };
-
-                if hashtable
-                    .relink_item(
-                        item.key(),
-                        self.id(),
-                        self.id(),
-                        read_offset as u64,
-                        write_offset as u64,
-                    )
-                    .is_ok()
-                {
-                    // note that we use a copy that can handle overlap
-                    unsafe {
-                        // std::ptr::copy(src, dst, item_size);
-                        std::ptr::copy(src, dst, std::cmp::min(ITEM_HDR_SIZE + item.klen() as usize, item_size));
-                    }
-                } else {
-                    // this shouldn't happen, but if relink does fail we can
-                    // only move forward or return an error
-                    read_offset += item_size;
-                    write_offset = read_offset;
-                    continue;
-                }
-            }
-
-            read_offset += item_size;
-            write_offset += item_size;
-            continue;
-        }
-
-        // updates the write offset to the new position
-        self.set_write_offset(write_offset as i32);
-
-        Ok(())
-    }
-
     /// This is used to copy data from this segment into the target segment and
     /// relink the items in the hashtable
     ///
@@ -419,7 +342,7 @@ impl<'a> Segment<'a> {
             let write_offset = target.write_offset() as usize;
 
             // skip deleted items and ones that won't fit in the target segment
-            if item.deleted() || write_offset + item_size >= target.data.len() {
+            if item.deleted() || write_offset + item_size > target.data.len() {
                 read_offset += item_size;
                 continue;
             }
@@ -457,106 +380,6 @@ impl<'a> Segment<'a> {
         }
 
         Ok(())
-    }
-
-    /// This is used as part of segment merging, it removes items from the
-    /// segment based on a cutoff frequency and target ratio. Since the cutoff
-    /// frequency is adjusted, it is returned as the result.
-    pub(crate) fn prune(
-        &mut self,
-        hashtable: &mut HashTable,
-        cutoff_freq: f64,
-        target_ratio: f64,
-    ) -> f64 {
-        let max_offset = self.max_item_offset();
-        let mut offset = if cfg!(feature = "magic") {
-            std::mem::size_of_val(&SEG_MAGIC)
-        } else {
-            0
-        };
-
-        let to_keep = (self.data.len() as f64 * target_ratio).floor() as i32;
-        let to_drop = self.live_bytes() - to_keep;
-
-        let mut n_scanned = 0;
-        let mut n_dropped = 0;
-        let mut n_retained = 0;
-
-        let mean_size = self.live_bytes() as f64 / self.live_items() as f64;
-        let mut cutoff = (1.0 + cutoff_freq) / 2.0;
-        let mut n_th_update = 1;
-        let update_interval = self.data.len() / 10;
-
-        while offset <= max_offset {
-            let item = self.get_item_at(offset).unwrap();
-            if item.klen() == 0 && self.live_items() == 0 {
-                break;
-            }
-
-            item.check_magic();
-
-            let item_size = item.size();
-
-            if item.deleted() {
-                // do we need to evict again here? Why is that done in the C code?
-                offset += item_size;
-                continue;
-            }
-
-            n_scanned += item_size;
-
-            if n_scanned >= (n_th_update * update_interval) {
-                n_th_update += 1;
-                // magical formula for adjusting cutoff based on retention,
-                // scan progress, and target ratio
-                let t = ((n_retained as f64) / (n_scanned as f64) - target_ratio) / target_ratio;
-                if !(-0.5..=0.5).contains(&t) {
-                    cutoff *= 1.0 + t;
-                }
-                trace!("cutoff adj to: {}", cutoff);
-            }
-
-            let item_frequency =
-                hashtable.get_freq(item.key(), self, offset as u64).unwrap() as f64;
-            let weighted_frequency = item_frequency / (item_size as f64 / mean_size);
-
-            if cutoff >= 0.0001
-                && to_drop > 0
-                && n_dropped < to_drop as usize
-                && weighted_frequency <= cutoff
-            {
-                trace!(
-                    "evicting item size: {} freq: {} w_freq: {} cutoff: {}",
-                    item_size,
-                    item_frequency,
-                    weighted_frequency,
-                    cutoff
-                );
-                if !hashtable.evict(item.key(), offset.try_into().unwrap(), self) {
-                    // this *shouldn't* happen, but to keep header integrity, we
-                    // warn and remove the item even if it wasn't in the
-                    // hashtable
-                    warn!("unlinked item was present in segment");
-                    self.remove_item_at(offset, true);
-                }
-                n_dropped += item_size;
-                offset += item_size;
-                continue;
-            } else {
-                trace!(
-                    "keeping item size: {} freq: {} w_freq: {} cutoff: {}",
-                    item_size,
-                    item_frequency,
-                    weighted_frequency,
-                    cutoff
-                );
-            }
-
-            offset += item_size;
-            n_retained += item_size;
-        }
-
-        cutoff
     }
 
     /// Remove all items from the segment, unlinking them from the hashtable.

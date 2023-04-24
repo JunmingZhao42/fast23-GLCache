@@ -16,6 +16,7 @@ pub(crate) struct SegmentsBuilder {
     pub(super) segment_size: i32,
     pub(super) evict_policy: Policy,
     pub(super) datapool_path: Option<PathBuf>,
+    pub(super) start_idx: u32,
 }
 
 impl Default for SegmentsBuilder {
@@ -25,6 +26,7 @@ impl Default for SegmentsBuilder {
             heap_size: 64 * 1024 * 1024,
             evict_policy: Policy::Random,
             datapool_path: None,
+            start_idx: 0,
         }
     }
 }
@@ -48,6 +50,11 @@ impl<'a> SegmentsBuilder {
         self
     }
 
+    // /// Get individual segment size in bytes
+    // pub fn get_segment_size(&self) -> i32 {
+    //     self.segment_size
+    // }
+
     /// Specify the total heap size in bytes. The heap size will be divided by
     /// the segment size to determine the number of segments to allocate.
     pub fn heap_size(mut self, bytes: usize) -> Self {
@@ -66,7 +73,17 @@ impl<'a> SegmentsBuilder {
     /// a file will be created at the corresponding path and used for segment
     /// storage.
     pub fn datapool_path<T: AsRef<Path>>(mut self, path: Option<T>) -> Self {
-        self.datapool_path = path.map(|p| p.as_ref().to_owned());
+        if path.is_none() {
+            self.datapool_path = None;
+        } else {
+            let time = format!("segfile-{}", chrono::Utc::now().format("%T"));
+            self.datapool_path = Some(path.unwrap().as_ref().to_owned().join(time));
+        }
+        self
+    }
+
+    pub fn start_idx(mut self, start: u32) -> Self {
+        self.start_idx = start;
         self
     }
 

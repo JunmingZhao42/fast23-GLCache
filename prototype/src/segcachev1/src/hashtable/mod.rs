@@ -159,27 +159,6 @@ impl HashTable {
         if curr_ts != get_ts(bucket.data[0]) {
             bucket.data[0] = (bucket.data[0] & !TS_MASK) | (curr_ts << TS_BIT_SHIFT);
 
-            loop {
-                let n_item_slot = if chain_idx == chain_len {
-                    N_BUCKET_SLOT
-                } else {
-                    N_BUCKET_SLOT - 1
-                };
-
-                for i in 0..n_item_slot {
-                    if chain_idx == 0 && i == 0 {
-                        continue;
-                    }
-                    bucket.data[i] &= CLEAR_FREQ_SMOOTH_MASK;
-                }
-
-                if chain_idx == chain_len {
-                    break;
-                }
-                bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-                chain_idx += 1;
-            }
-
             // reset to start of chain
             chain_idx = 0;
             bucket = &mut self.data[bucket_id as usize];
@@ -212,20 +191,6 @@ impl HashTable {
                     let current_item = current_item_op.unwrap();
                     if current_item.key() != key {
                     } else {
-                        // update item frequency
-                        let mut freq = get_freq(current_info);
-                        if freq < 127 {
-                            let rand: u64 = self.rng.gen();
-                            if freq <= 16 || rand % freq == 0 {
-                                freq = ((freq + 1) | 0x80) << FREQ_BIT_SHIFT;
-                            } else {
-                                freq = (freq | 0x80) << FREQ_BIT_SHIFT;
-                            }
-                            if bucket.data[i] == current_info {
-                                bucket.data[i] = (current_info & !FREQ_MASK) | freq;
-                            }
-                        }
-
                         let item = Item::new(
                             current_item,
                             get_cas(self.data[(hash & self.mask) as usize].data[0]),
@@ -294,51 +259,6 @@ impl HashTable {
 
                         return Some(item);
                     }
-                }
-            }
-
-            if chain_idx == chain_len {
-                break;
-            }
-            bucket = &mut self.data[bucket.data[N_BUCKET_SLOT - 1] as usize];
-            chain_idx += 1;
-        }
-
-        None
-    }
-
-    /// Return the frequency for the item with the key
-    #[allow(dead_code)]
-    pub fn get_freq(&mut self, key: &[u8], segment: &mut Segment, offset: u64) -> Option<u64> {
-        let hash = self.hash(key);
-        let tag = tag_from_hash(hash);
-        let bucket_id = hash & self.mask;
-
-        let mut bucket = &mut self.data[bucket_id as usize];
-        let chain_len = chain_len(bucket.data[0]);
-        let mut chain_idx = 0;
-
-        loop {
-            let n_item_slot = if chain_idx == chain_len {
-                N_BUCKET_SLOT
-            } else {
-                N_BUCKET_SLOT - 1
-            };
-
-            for i in 0..n_item_slot {
-                if chain_idx == 0 && i == 0 {
-                    continue;
-                }
-                let current_info = bucket.data[i];
-
-                // we can't actually check for a collision here since the item
-                // may be in another segment, so just check if it's at the same
-                // offset in the segment and treat that as a match
-                if get_tag(current_info) == tag
-                    && get_seg_id(current_info) == Some(segment.id())
-                    && get_offset(current_info) == offset
-                {
-                    return Some(get_freq(current_info) & 0x7F);
                 }
             }
 
@@ -558,20 +478,6 @@ impl HashTable {
                     let current_item = current_item_op.unwrap();
                     if current_item.key() != key {
                     } else {
-                        // update item frequency
-                        let mut freq = get_freq(current_info);
-                        if freq < 127 {
-                            let rand: u64 = self.rng.gen();
-                            if freq <= 16 || rand % freq == 0 {
-                                freq = ((freq + 1) | 0x80) << FREQ_BIT_SHIFT;
-                            } else {
-                                freq = (freq | 0x80) << FREQ_BIT_SHIFT;
-                            }
-                            if bucket.data[i] == current_info {
-                                bucket.data[i] = (current_info & !FREQ_MASK) | freq;
-                            }
-                        }
-
                         if cas == get_cas(bucket.data[0]) {
                             // TODO(bmartin): what is expected on overflow of the cas bits?
                             self.data[(hash & self.mask) as usize].data[0] += 1;
@@ -700,7 +606,7 @@ impl HashTable {
                 if chain_idx == 0 && i == 0 {
                     continue;
                 }
-                let current_item_info = clear_freq(bucket.data[i]);
+                let current_item_info = bucket.data[i];
                 if get_tag(current_item_info) != tag {
                     continue;
                 }

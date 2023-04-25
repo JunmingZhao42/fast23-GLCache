@@ -576,16 +576,9 @@ impl Segments {
                                 continue;
                             }
                             // copy
-                            if old_seg.copy_into(
-                                &mut tail_seg, 
-                                hashtable
-                            ).is_err() {
-                                return Err(SegmentsError::RelinkFailure);
-                            }
+                            old_seg.copy_into(&mut tail_seg, hashtable)?;
                             // remove the old-segment from ttl_bucket
-                            // MY-TODO-LATER: this should not be needed
                             old_seg.clear(hashtable, false);
-                            old_seg.set_accessible(false);
                             // reset ttl-head
                             if old_seg.prev_seg().is_none() {
                                 ttl_bucket.set_head(old_seg.next_seg());
@@ -646,7 +639,7 @@ impl Segments {
                         }
                     }            
                 }
-                // println!("demoted {} segments", demoted);
+                // println!("demote {} segments in {:?}", demoted, now.elapsed().as_micros());
                 demoted
             }
         }

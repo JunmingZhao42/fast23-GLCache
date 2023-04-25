@@ -88,6 +88,10 @@ impl Bench {
     }
 
     pub fn run(&mut self) {
+        let mut get_time = 0;
+        let mut set_time = 0;
+        let mut del_time = 0;
+
         self.start_time = std::time::Instant::now();
         let mut request: Request = Request::default(); 
         if let Err(err) = self.reader.read(&mut request) {
@@ -122,21 +126,30 @@ impl Bench {
                 Ok(()) => {
                     match request.op {
                         Op::Get => {
+                            let now = std::time::Instant::now();
+                            let ret = self.cache.get(&request, &mut buf);
                             self.n_get_interval += 1;
-                            if !self.cache.get(&request, &mut buf) {
+                            get_time += now.elapsed().as_micros();
+                            if !ret {
+                                let now = std::time::Instant::now();
                                 self.n_get_miss_interval += 1;
                                 self.n_set_interval += 1;
                                 self.cache.set(&request);
-                            } 
+                                set_time += now.elapsed().as_micros();
+                            }
                         }
                         Op::Set => {
+                            let now = std::time::Instant::now();
                             self.n_set_interval += 1;
                             self.cache.set(&request); 
+                            set_time += now.elapsed().as_micros();
                         }
                         Op::Del => {
+                            let now = std::time::Instant::now();
                             self.n_del_interval += 1;
                             if ! self.cache.del(&request) {
                             }
+                            del_time += now.elapsed().as_micros();
                         }
                         Op::Invalid => {
                             panic!("invalid op");
@@ -172,6 +185,8 @@ impl Bench {
             }
         }
 
+        info!("GET {} us, SET {} us, DEL {} us", get_time, set_time, del_time);
+        info!("GET# {}, SET# {}, DEL# {}", self.n_get, self.n_set, self.n_del);
         self.trace_time = request.real_time as i32 - trace_start;
         self.end_time = std::time::Instant::now();
     }

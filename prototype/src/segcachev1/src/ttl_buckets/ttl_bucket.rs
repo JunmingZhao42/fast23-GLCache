@@ -76,6 +76,7 @@ impl TtlBucket {
         self.head2 = id;
     }
 
+    #[allow(dead_code)]
     pub fn tail(&self) -> Option<NonZeroU32> {
         self.tail
     }

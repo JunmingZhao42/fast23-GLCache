@@ -68,6 +68,7 @@ impl Segments {
 
         // TODO(bmartin): we always prefault, this should be configurable
         let mut data: Box<dyn Datapool> = if let Some(file) = builder.datapool_path {
+            info!("Allocated file backed storage: {:?}", file.as_path());
             let pool = File::create(file, heap_size, true)
                 .expect("failed to allocate file backed storage");
             Box::new(pool)
@@ -92,7 +93,9 @@ impl Segments {
         }
 
         info!("Heap size (byte): {}", heap_size);
-        info!("Evict policy: {:?} \n", evict_policy);
+        info!("Evict policy: {:?}", evict_policy);
+        info!("Start index: {}", builder.start_idx);
+        info!("Number of segments: {}", segments);
 
         Self {
             headers,
@@ -157,12 +160,16 @@ impl Segments {
     ) -> Option<RawItem> {
         let seg_id = seg_id.map(|v| v.get())?;
         trace!("getting item from: seg: {} offset: {}", seg_id, offset);
-        assert!(seg_id <= self.cap as u32);
 
-        let seg_begin = self.segment_size() as usize * (seg_id as usize - 1);
+        if !self.seg_id_valid(unsafe { NonZeroU32::new_unchecked(seg_id) }) {
+            return None;
+        }
+
+        let id_idx = (seg_id - 1 - self.start_idx) as usize;
+        let seg_begin = self.segment_size() as usize * id_idx;
         let seg_end = seg_begin + self.segment_size() as usize;
         let mut segment = Segment::from_raw_parts(
-            &mut self.headers[seg_id as usize - 1],
+            &mut self.headers[id_idx],
             &mut self.data.as_mut_slice()[seg_begin..seg_end],
         );
 
@@ -176,6 +183,8 @@ impl Segments {
         hashtable: &mut HashTable,
         expire: bool,
     ) -> Result<(), ()> {
+        assert!(self.seg_id_valid(id));
+
         let mut segment = self.get_mut(id).unwrap();
         if segment.next_seg().is_none() && !expire {
             Err(())
@@ -212,10 +221,16 @@ impl Segments {
                     self.clear_segment(id, hashtable, false)
                         .map_err(|_| SegmentsError::EvictFailure)?;
 
-                    let id_idx = id.get() as usize - 1;
+                    let id_idx = (id.get() - 1 - self.start_idx) as usize;
+                    // relink head
                     if self.headers[id_idx].prev_seg().is_none() {
                         let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
-                        ttl_bucket.set_head(self.headers[id_idx].next_seg());
+                        ttl_bucket.set_head2(self.headers[id_idx].next_seg());
+                    }
+                    // relink tail
+                    if self.headers[id_idx].next_seg().is_none() {
+                        let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+                        ttl_bucket.set_tail2(self.headers[id_idx].prev_seg());
                     }
                     self.push_free(id);
                     Ok(())
@@ -228,7 +243,9 @@ impl Segments {
 
     /// Returns a mutable `Segment` view for the segment with the specified id
     pub(crate) fn get_mut(&mut self, id: NonZeroU32) -> Result<Segment, SegmentsError> {
-        let id = id.get() as usize - 1;
+        assert!(self.seg_id_valid(id));
+        let id = (id.get() - 1 - self.start_idx) as usize;
+
         if id < self.headers.len() {
             let header = self.headers.get_mut(id).unwrap();
 
@@ -527,6 +544,8 @@ impl Segments {
     }
 
 
+    // NOTE: at the moment this should only be called by segments,
+    // move into segments2
     pub fn move_seg_into(
         &mut self,
         seg_id: NonZeroU32,
@@ -534,7 +553,8 @@ impl Segments {
         hashtable: &mut HashTable, 
         other_segs: &mut Segments,
     ) -> Result<(), SegmentsError> {
-        let to_ssd = !other_segs.is_dram();
+        assert!(self.is_dram(), "cannot promote from segments2 yet");
+        assert!(!other_segs.is_dram(), "the other segments has to be segments2");
 
         // 1. input the least/most valuable from the current segment
         assert!(self.seg_id_valid(seg_id));
@@ -550,13 +570,7 @@ impl Segments {
             match ttl_bucket.try_expand(other_segs) {
                 Ok(()) => {
                     // expand segments successful, copy into tail
-                    let ttl_tail = 
-                        if to_ssd {
-                            ttl_bucket.tail2()
-                        } else {
-                            ttl_bucket.tail()
-                        };
-                    if let Some(id) = ttl_tail {
+                    if let Some(id) =  ttl_bucket.tail2() {
                         if let Ok(mut tail_seg) = other_segs.get_mut(id) {
                             if !tail_seg.accessible() {
                                 continue;
@@ -574,19 +588,11 @@ impl Segments {
                             old_seg.set_accessible(false);
                             // reset ttl-head
                             if old_seg.prev_seg().is_none() {
-                                if to_ssd {
-                                    ttl_bucket.set_head(old_seg.next_seg());
-                                } else {
-                                    ttl_bucket.set_head2(old_seg.next_seg());
-                                }
+                                ttl_bucket.set_head(old_seg.next_seg());
                             }
                             // reset ttl-tail
                             if old_seg.next_seg().is_none() {
-                                if to_ssd {
-                                    ttl_bucket.set_tail(old_seg.prev_seg());
-                                } else {
-                                    ttl_bucket.set_tail2(old_seg.prev_seg());
-                                }
+                                ttl_bucket.set_tail(old_seg.prev_seg());
                             }
                             self.push_free(seg_id);
                             return Ok(());
@@ -632,11 +638,15 @@ impl Segments {
                             segments2
                         ).is_ok() {
                             // copy into the tail segment of ttl_bucket
-                            debug!("DRAM{} demoted", seg_id.get());
                             demoted += 1;
+                        } else {
+                            for _ in 0..count {
+                                let _ = segments2.evict(ttl_buckets, hashtable);
+                            }
                         }
                     }            
                 }
+                // println!("demoted {} segments", demoted);
                 demoted
             }
         }

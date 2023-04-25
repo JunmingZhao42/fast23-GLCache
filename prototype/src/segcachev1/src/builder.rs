@@ -165,7 +165,7 @@ impl Builder {
     }
 
     // for now just fix this datapool path
-    pub fn datapool_path2<T: AsRef<Path>>(mut self) -> Self {
+    pub fn datapool_path2(mut self) -> Self {
         self.segments_builder2 = self.segments_builder2.datapool_path(Some(&HEAP_PATH));
         self
     }

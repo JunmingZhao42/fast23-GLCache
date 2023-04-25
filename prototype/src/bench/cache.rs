@@ -36,16 +36,13 @@ pub fn create_cache(args: &Box<Args>) -> Cache {
                 .segment_size((args.segment_size_in_kb * KB) as i32)
                 .heap_size(args.cache_size_in_mb * MB)
                 .hash_power(args.hash_power)
-                .eviction(segv1::Policy::Merge {
-                    max: 16,
-                    merge: 4,
-                    compact: 0,
-                });
+                .eviction(segv1::Policy::Fifo);
 
             if args.datapool_path.len() > 0 {
                 cb = cb.datapool_path(Some(args.datapool_path.clone()));
             }
 
+            cb = cb.datapool_path2();
             let cache = cb.build();
 
             Cache::SegCacheV1(cache, args.cache_size_in_mb, args.cache_type.to_string())

@@ -23,7 +23,7 @@ impl Default for SegmentsBuilder {
     fn default() -> Self {
         Self {
             segment_size: 1024 * 1024,
-            heap_size: 64 * 1024 * 1024,
+            heap_size: 1000 * 1024 * 1024,
             evict_policy: Policy::Random,
             datapool_path: None,
             start_idx: 0,
@@ -76,7 +76,7 @@ impl<'a> SegmentsBuilder {
         if path.is_none() {
             self.datapool_path = None;
         } else {
-            let time = format!("segfile-{}", chrono::Utc::now().format("%T"));
+            let time = format!("segfile-hybrid2{}", chrono::Utc::now().format("%T"));
             self.datapool_path = Some(path.unwrap().as_ref().to_owned().join(time));
         }
         self

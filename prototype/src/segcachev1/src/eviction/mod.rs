@@ -77,7 +77,7 @@ impl Eviction {
             Policy::None | Policy::Random | Policy::RandomFifo | Policy::Merge { .. } => false,
             Policy::Fifo | Policy::Cte | Policy::Util => {
                 if self.ranked_segs[0].is_none()
-                    || (now - self.last_update_time).as_secs() > 1
+                    || (now - self.last_update_time).as_secs() > 10
                     || self.ranked_segs.len() < (self.index + 8)
                 {
                     self.last_update_time = now;

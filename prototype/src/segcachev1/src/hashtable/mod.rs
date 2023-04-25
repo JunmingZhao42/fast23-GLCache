@@ -425,6 +425,7 @@ impl HashTable {
         offset: u64,
         ttl_buckets: &mut TtlBuckets,
         segments: &mut Segments,
+        segments2: &mut Segments,
     ) -> Result<(), ()> {
 
         let hash = self.hash(item.key());
@@ -450,6 +451,7 @@ impl HashTable {
                     continue;
                 }
                 let current_item_info = self.data[bucket_id].data[i];
+                // case 1: tag not same
                 if get_tag(current_item_info) != tag {
                     if insert_item_info != 0 && current_item_info == 0 {
                         // found a blank slot
@@ -458,11 +460,22 @@ impl HashTable {
                     }
                     continue;
                 }
-                if segments.get_item(current_item_info).unwrap().key() != item.key() {
-                } else {
+                // case 2: tag same, but not same key
+                let seg_id = get_seg_id(current_item_info).unwrap();
+                let current_item_op: Option<RawItem> = 
+                    if segments.seg_id_valid(seg_id) {
+                        segments.get_item(current_item_info)
+                    } else {
+                        segments2.get_item(current_item_info) 
+                    };
+                if current_item_op.unwrap().key() == item.key() {
                     // update existing key
                     self.data[bucket_id].data[i] = insert_item_info;
-                    let _ = segments.remove_item(current_item_info, true, ttl_buckets, self);
+                    if segments.seg_id_valid(seg_id) {
+                        let _ = segments.remove_item(current_item_info, true, ttl_buckets, self);
+                    } else {
+                        let _ = segments2.remove_item(current_item_info, true, ttl_buckets, self);
+                    };
                     insert_item_info = 0;
                 }
             }

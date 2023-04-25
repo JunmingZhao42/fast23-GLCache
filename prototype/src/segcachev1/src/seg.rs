@@ -7,7 +7,7 @@
 use crate::*;
 
 const RESERVE_RETRIES: usize = 3;
-const DEMOTE_NUM: usize = 1;
+const DEMOTE_NUM: usize = 10;
 
 /// A pre-allocated key-value store with eager expiration. It uses a
 /// segment-structured design that stores data in fixed-size segments, grouping
@@ -182,6 +182,7 @@ impl Seg {
                 reserved.offset() as u64,
                 &mut self.ttl_buckets,
                 &mut self.segments,
+                &mut self.segments2,
             )
             .is_err()
         {

@@ -186,7 +186,6 @@ impl Bench {
         }
 
         info!("GET {} us, SET {} us, DEL {} us", get_time, set_time, del_time);
-        info!("GET# {}, SET# {}, DEL# {}", self.n_get, self.n_set, self.n_del);
         self.trace_time = request.real_time as i32 - trace_start;
         self.end_time = std::time::Instant::now();
     }

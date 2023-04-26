@@ -47,6 +47,7 @@ pub(crate) const TS_BIT_SHIFT: u64 = 32;
 
 /// A mask to get the bits containing the item tag from the item info
 pub(crate) const TAG_MASK: u64 = 0xFFFF_F000_0000_0000;
+pub(crate) const TAG_MASK2: u64 = 0x0000_1000_0000_0000;
 /// A mask to get the bits containing the containing segment id from the item
 /// info
 pub(crate) const SEG_ID_MASK: u64 = 0x0000_0FFF_FFF0_0000;
@@ -81,7 +82,7 @@ impl HashBucket {
 /// Calculate a item's tag from the hash value
 #[inline]
 pub const fn tag_from_hash(hash: u64) -> u64 {
-    hash & TAG_MASK
+    (hash & TAG_MASK) | TAG_MASK2
 }
 
 /// Get the item's offset from the item info

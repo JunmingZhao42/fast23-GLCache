@@ -31,6 +31,7 @@ fn main() {
     bench.run();
     bench.report();
 
+    println!("GET# {}, SET# {}, DEL# {}", bench.n_get, bench.n_set, bench.n_del);
     println!("{:?} {:?}", CoarseInstant::recent(), args);
 }
 

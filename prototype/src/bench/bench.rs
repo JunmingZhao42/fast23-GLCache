@@ -75,10 +75,9 @@ impl Bench {
         let n_req = self.n_get + self.n_set + self.n_del;
         let trace_time_str = format!("{:.2}", self.trace_time as f64 / 3600.0);
 
-        println!("{} req, trace {} hour, {:.2} sec, throughput {:.2} MQPS, miss ratio {:.4}, interval miss ratio {:.4}", 
+        println!("{} req, trace {} hour, {:.2} sec, throughput {:.2} MQPS, miss ratio {:.4}", 
             self.n_get, trace_time_str, runtime, n_req as f64 / runtime / 1e6, 
-            self.n_get_miss as f64 / self.n_get as f64, 
-            self.n_get_miss_interval as f64 / self.n_get_interval as f64, 
+            self.n_get_miss as f64 / (self.n_get as f64 + self.n_get_miss as f64), 
         );
 
         self.n_get_interval = 0;
@@ -128,14 +127,15 @@ impl Bench {
                         Op::Get => {
                             let now = std::time::Instant::now();
                             let ret = self.cache.get(&request, &mut buf);
-                            self.n_get_interval += 1;
-                            get_time += now.elapsed().as_micros();
                             if !ret {
                                 let now = std::time::Instant::now();
                                 self.n_get_miss_interval += 1;
                                 self.n_set_interval += 1;
                                 self.cache.set(&request);
                                 set_time += now.elapsed().as_micros();
+                            } else {
+                                get_time += now.elapsed().as_micros();
+                                self.n_get_interval += 1;
                             }
                         }
                         Op::Set => {

@@ -399,129 +399,6 @@ impl Segments {
         }
     }
 
-    fn evict_fifo_merge(&mut self, 
-        ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
-        curr_vtime: u64,
-        ghost_map: &mut HashMap<u64, u64>, 
-    ) -> Result<(), SegmentsError> {
-        let buckets = ttl_buckets.buckets.len();
-
-        let seg_idx = self.evict.random() % self.cap;
-        let ttl = self.headers[seg_idx as usize].ttl();
-        let offset = ttl_buckets.get_bucket_index(ttl);
-
-        // since merging starts in the middle of a segment chain, we may
-        // need to loop back around to the first ttl bucket we checked
-        // we use buckets * 2 because if there is one bucket with all the segments, 
-        // from time to time, the next to evict reaches the end of chain of this bucket 
-        // it will not be able to evict 
-        // let mut has_kicked_stubborn_segment = false;
-        for i in 0..=buckets * 2 { 
-            let bucket_id = (offset + i) % buckets;
-            let ttl_bucket = &mut ttl_buckets.buckets[bucket_id];
-
-            if let Some(first_seg) = ttl_bucket.head() {
-                let start = ttl_bucket.next_to_merge().unwrap_or(first_seg);
-                debug_assert!(!self.headers[start.get() as usize - 1].is_expired());
-                debug_assert_eq!(self.headers[start.get() as usize - 1].ttl().as_secs(), ttl_bucket.ttl() as u32);
-
-                if let Err(_err) = self.merge_evict_chain_len(start) {
-                    ttl_bucket.set_next_to_merge(ttl_bucket.head()); 
-                    continue; 
-                }
-
-                match self.merge_evict(start, hashtable, ttl_bucket, curr_vtime, true, true, ghost_map) {
-                    Ok((next_to_merge, _n_merged)) => {
-                        ttl_bucket.set_next_to_merge(next_to_merge); 
-
-                        return Ok(());
-                    }
-                    Err(_err) => {
-                        ttl_bucket.set_next_to_merge(None);
-                        // this happens when we evict close to the end of segment chain, and it is normal
-                        trace!("timestamp {:?} cannot merge ttl_bucket {}: {}, bucket has {} seg", 
-                            CoarseInstant::now(), bucket_id, _err, ttl_bucket.nseg());
-                        continue;
-                    }
-                }
-            }
-        }
-        ttl_buckets.print_age_of_buckets(self);
-        Err(SegmentsError::NoEvictableSegments)
-    }
-
-    fn evict_rank_merge(
-        &mut self, 
-        ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
-        curr_vtime: u64,
-        ghost_map: &mut HashMap<u64, u64>,
-    ) -> Result<(), SegmentsError> {
-
-        // find a segment to evict 
-        let mut seg_id = self.evict.least_valuable_seg(); 
-        // while !self.headers[seg_id.unwrap().get() as usize - 1].can_evict_this_round {
-        while let Err(_err) = self.merge_evict_chain_len(seg_id.unwrap()) {
-            // println!("not evictable {:?} {}", self.evict.index, seg_id.unwrap().get());
-            seg_id = self.evict.least_valuable_seg();
-
-            if seg_id.is_none() {
-                return self.evict(ttl_buckets, hashtable, curr_vtime, ghost_map); 
-            }
-        }
-        
-        let start = self.get_mut(seg_id.unwrap()).unwrap(); 
-
-        let ttl_bucket = ttl_buckets.get_mut_bucket(start.ttl());
-        match self.merge_evict(seg_id.unwrap(), hashtable, ttl_bucket, curr_vtime, false, true, ghost_map) {
-            Ok((next_to_merge, _n_merged)) => {
-                ttl_bucket.set_next_to_merge(next_to_merge); 
-
-                return Ok(());
-            }
-            Err(_err) => {
-                // this happens when we evict close to the end of segment chain, and it is normal
-                println!("timestamp {:?} cannot merge ttl_bucket {:?}: {}, bucket has {} seg", 
-                    CoarseInstant::now(), ttl_bucket, _err, ttl_bucket.nseg());
-                
-                return Err(_err); 
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn evict_rank_reinsert (
-        &mut self, 
-        ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
-        curr_vtime: u64,
-        ghost_map: &mut HashMap<u64, u64>,
-    ) -> Result<(), SegmentsError> {
-
-        // find a segment to evict 
-        let seg_id = self.evict.least_valuable_seg(); 
-        if seg_id.is_none() {
-            return self.evict(ttl_buckets, hashtable, curr_vtime, ghost_map); 
-        }
-
-        let start = self.get_mut(seg_id.unwrap()).unwrap(); 
-        let ttl_bucket = ttl_buckets.get_mut_bucket(start.ttl());
-
-        match self.merge_reinsert(seg_id.unwrap(), hashtable, ttl_bucket, curr_vtime, false, true, ghost_map) {
-            Ok(()) => {
-                return Ok(());
-            }
-            Err(_err) => {
-                // this happens when we evict close to the end of segment chain, and it is normal
-                println!("timestamp {:?} cannot merge ttl_bucket {:?}: {}, bucket has {} seg", 
-                    CoarseInstant::now(), ttl_bucket, _err, ttl_bucket.nseg());
-                
-                return Err(_err); 
-            }
-        }
-    }
-
     /// TODO: currently resets the full cache, but we only need to reset for the sampled segments
     pub(crate) fn reset_accessed_since_snapshot(
         &mut self, 
@@ -574,29 +451,15 @@ impl Segments {
 
         match self.evict.policy_mut() {
             Policy::Merge { .. } => {
-                return self.evict_fifo_merge(ttl_buckets, hashtable, curr_vtime, ghost_map);
+                return Err(SegmentsError::NoEvictableSegments);
             }
             Policy::OracleMerge { n_merge:_n_merge, .. } => {
-                if should_rerank {
-                    // calculate segment utility for each segment 
-                    #[cfg(feature="oracle_reuse")] {
-                        let retain_frac = 1.0 / *_n_merge as f32; 
-                        self.update_segment_pred_utility(curr_vtime, retain_frac); 
-                    }
-
-                    self.evict.rerank(&self.headers);
-                }
-
-                return self.evict_rank_merge(ttl_buckets, hashtable, curr_vtime, ghost_map);
+                return Err(SegmentsError::NoEvictableSegments);
             }
-            Policy::LearnedMerge{train_interval_sec, time_before_first_train_data, learner, ..} => {
-                if curr_sec <= *time_before_first_train_data + *train_interval_sec {
-                    // use FIFO merge during warm up
-                    return self.evict_fifo_merge(ttl_buckets, hashtable, curr_vtime, ghost_map); 
-                }
-                
+            Policy::LearnedMerge{train_interval_sec, time_before_first_train_data, learner, ..} => {                
                 // use learned eviction when we have a model 
-                if should_rerank {
+                if curr_sec > *time_before_first_train_data + *train_interval_sec
+                    && should_rerank {
                     let mut performed_training = false;
 
                     if curr_sec >= learner.next_train_time {
@@ -630,8 +493,27 @@ impl Segments {
                     }
                 }
                 
-                return self.evict_rank_merge(ttl_buckets, hashtable, curr_vtime, ghost_map);
-                // return self.evict_rank_reinsert(ttl_buckets, hashtable, curr_vtime, ghost_map);
+                let mut num_evicted = 0;
+                while num_evicted < 10 {
+                    if let Some(id) = self.least_valuable_seg(ttl_buckets) {
+                        if let Err(err) = self.clear_segment(id, hashtable, false, false) {
+                            debug!("clear err {:?}", err); 
+                            return Err(SegmentsError::EvictFailure);
+                        }
+
+                        let id_idx = id.get() as usize - 1;
+                        let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+                        self.push_free(id, Some(ttl_bucket));
+                        num_evicted += 1;
+                        
+                    } else if num_evicted == 0 {
+                        return Err(SegmentsError::NoEvictableSegments);
+                    } else {
+                        return Ok(())
+                    }
+                }
+                return Ok(());
+
             }
             Policy::None => Err(SegmentsError::NoEvictableSegments),
             _ => {
@@ -643,13 +525,8 @@ impl Segments {
 
                     let id_idx = id.get() as usize - 1;
                     let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
-                    // if self.headers[id_idx].prev_seg().is_none() {
-                    //     ttl_bucket.set_head(self.headers[id_idx].next_seg());
-                    // }
-                    // ttl_bucket.reduce_nseg(1);
                     self.push_free(id, Some(ttl_bucket));
 
-                    // println!("current timestamp {:?} ttl {} evict {} nseg {} -> {}", CoarseInstant::now(), ttl_bucket.get_ttl(), id, n_seg, ttl_bucket.get_nseg()); 
                     Ok(())
                 } else {
                     Err(SegmentsError::NoEvictableSegments)
@@ -679,6 +556,7 @@ impl Segments {
 
     /// Gets a mutable `Segment` view for two segments after making sure the
     /// borrows are disjoint.
+    #[allow(dead_code)]
     pub(crate) fn get_mut_pair(
         &mut self,
         a: NonZeroU32,
@@ -844,7 +722,7 @@ impl Segments {
 
                 None
             }
-            Policy::RandomFifo => {
+           Policy::RandomFifo => {
                 // This strategy is implemented by picking a random accessible
                 // segment and looking up the head of the corresponding
                 // `TtlBucket` and evicting that segment. This is functionally
@@ -857,13 +735,44 @@ impl Segments {
 
                 for i in 0..self.cap {
                     let idx = (start + i) % self.cap;
-                    if self.headers[idx as usize].accessible() {
+                    if self.headers[idx as usize].evictable() {
                         let ttl = self.headers[idx as usize].ttl();
                         let ttl_bucket = ttl_buckets.get_mut_bucket(ttl);
                         return ttl_bucket.head();
                     }
                 }
 
+                None
+            }
+            Policy::LearnedMerge {train_interval_sec, time_before_first_train_data, ..} => {
+                if CoarseInstant::recent().as_secs() <= *time_before_first_train_data + *train_interval_sec {
+                    let mut start: u32 = (quickrandom() % (u32::MAX as u64)) as u32;
+
+                    start %= self.cap;
+    
+                    for i in 0..self.cap {
+                        let idx = (start + i) % self.cap;
+                        if self.headers[idx as usize].evictable() {
+                            if self.headers[idx as usize].can_evict() {
+                                // safety: we are always adding 1 to the index
+                                return Some(unsafe { NonZeroU32::new_unchecked(idx + 1) });
+                            }
+                        }
+                    }
+                }
+
+                if self.evict.should_rerank() {
+                    self.evict.rerank(&self.headers, );
+                }
+                while let Some(id) = self.evict.least_valuable_seg() {
+                    if let Ok(seg) = self.get_mut(id) {
+                        if seg.evictable() {
+                            if seg.can_evict() {
+                                return Some(id);
+                            }
+                        }
+                    }
+                }
                 None
             }
             _ => {
@@ -1050,455 +959,6 @@ impl Segments {
         println!("");
     }
 
-    fn merge_evict_chain_len(&self, start: NonZeroU32) -> Result<usize, NotEvictableReason> {
-        let mut len = 0;
-        let max = self.evict.max_merge();
-        let n_merge = self.evict.n_merge();
-        let mut header = &self.headers[start.get() as usize - 1]; 
-
-        while len < max {
-            if header.can_evict() {
-                len += 1;
-                header = &self.headers[header.next_seg().unwrap().get() as usize - 1];
-            } else {
-                if len < n_merge {
-                    // println!("segment chain has {} < {} segments can be evicted", len, n_merge);
-                    return Err(header.not_evictable_reason());
-                } else {
-                    return Ok(len);
-                }
-            }
-        }
-
-        Ok(len)
-    }
-
-    #[allow(dead_code)]
-    fn merge_compact_chain_len(&mut self, start: NonZeroU32) -> usize {
-        let mut len = 0;
-        let mut id = start;
-        let max = self.evict.max_merge();
-        let mut occupied = 0;
-        let seg_size = self.segment_size();
-
-        while len < max {
-            if let Ok(seg) = self.get_mut(id) {
-                if seg.can_evict() {
-                    occupied += seg.live_bytes();
-                    if occupied > seg_size {
-                        break;
-                    }
-                    len += 1;
-                    match seg.next_seg() {
-                        Some(i) => {
-                            id = i;
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                warn!("invalid segment id: {}", id);
-                break;
-            }
-        }
-
-        len
-    }
-
-    fn estimate_merge_cutoff(&mut self, 
-        start: NonZeroU32,
-        curr_vtime: u64
-    ) -> Result<(f64, usize), SegmentsError> {
-
-
-        let mut n_scanned = 0;
-        let n_merge = self.evict.n_merge(); 
-        let segment_size = self.segment_size();
-        
-        let mut total_size = 0;
-        let cap = self.headers[start.get() as usize -1].live_items() as usize * (self.evict.n_merge() + 2); 
-        let mut score_vec = Vec::with_capacity(cap);
-        
-        let mut curr_seg_id = start; 
-        while n_scanned < self.evict.max_merge() {
-            n_scanned += 1;
-            let mut seg = self.get_mut(curr_seg_id)?;
-
-            if seg.live_items() == 0 {
-                continue; 
-            }
-    
-            let max_offset = seg.max_item_offset();
-            let mut offset = seg.get_offset_start();
-    
-            while offset <= max_offset {
-                let item = seg.get_item_at(offset);
-                let item_size = item.size();
-                offset += item_size;
-
-                if item.is_deleted() {
-                    continue;
-                }
-    
-                let item_score = item.get_score(curr_vtime);
-
-                if item_score > f64::MIN_POSITIVE {
-                    total_size += item_size;
-                    score_vec.push((item_score, item_size as i32));
-                }
-            }
-
-            if n_scanned >= n_merge && total_size > segment_size as usize {
-                break;
-            }
-
-            curr_seg_id = seg.next_seg().unwrap();
-            if !self.headers[curr_seg_id.get() as usize - 1].can_evict() {
-                break;
-            }
-        }
-
-
-        if n_scanned < self.evict.n_merge() {
-            println!("only {} segments can be merged", n_scanned);
-            return Err(SegmentsError::EvictableSegmentChainTooShort);
-        }
-
-        if score_vec.len() == 0 {
-            assert_eq!(total_size, 0);
-            return Ok((f64::MAX, n_scanned)); 
-        }
-
-        score_vec.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
-
-        let mut new_seg_size = score_vec[0].1;
-        let mut idx = 0;
-        while new_seg_size < self.segment_size() && idx + 1 < score_vec.len() {
-            idx += 1;
-            new_seg_size += score_vec[idx].1;
-        }
-
-        // let cutoff_pos = idx;
-        // // if there are multiple with the same score, we will retain all 
-        // while idx + 1 < score_vec.len() && score_vec[idx+1].1 == score_vec[cutoff_pos].1 {
-        //     new_seg_size += score_vec[idx].1;
-        //     idx += 1;
-        // }
-        
-        let cutoff = score_vec[idx].0;
-
-        Ok((cutoff, n_scanned))
-    }
-
-    fn estimate_cutoff_one_seg(&mut self, 
-        start: NonZeroU32,
-        curr_vtime: u64, 
-        retain_size: i32,
-    ) -> Result<f64, SegmentsError> {
-
-        
-        let mut seg = self.get_mut(start)?;
-        if seg.live_items() == 0 {
-            panic!(""); 
-            // return Ok(f64::MAX); 
-        }
-    
-        let mut score_vec = Vec::with_capacity(seg.live_items() as usize);        
-
-        let max_offset = seg.max_item_offset();
-        let mut offset = seg.get_offset_start();
-    
-        while offset <= max_offset {
-            let item = seg.get_item_at(offset);
-            let item_size = item.size();
-            offset += item_size;
-
-            if item.is_deleted() {
-                continue;
-            }
-
-            let item_score = item.get_score(curr_vtime);
-
-            if item_score > f64::MIN_POSITIVE {
-                score_vec.push((item_score, item_size as i32));
-            } else {
-                println!("skip {:?} score {}", item.header(), item_score); 
-            }
-        }
-
-        assert_ne!(score_vec.len(), 0, "{:?}", seg.header); 
-
-        score_vec.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
-
-        let mut new_seg_size = 0;
-        let mut idx = 0;
-        while new_seg_size + score_vec[idx].1 <= retain_size as i32 {
-            new_seg_size += score_vec[idx].1;
-            idx += 1;
-
-            if  idx >= score_vec.len() {
-                break;
-            }
-        }
-
-        if idx == 0 {
-            return Ok(f64::MAX); 
-        } else {
-            return Ok(score_vec[idx - 1].0);
-        }
-    }
-
-    // can_evict_this_round: whether the segment evicted can be evicted again, used when the eviction uses ranking and 
-    // we do not evict more than once in each round (after ranking)
-    pub fn merge_evict(
-        &mut self,
-        start: NonZeroU32,
-        hashtable: &mut HashTable,
-        ttl_bucket: &mut TtlBucket,
-        curr_vtime: u64, 
-        can_evict_this_round: bool, 
-        remove_item_active_flag: bool, 
-        ghost_map: &mut HashMap<u64, u64>, 
-    ) -> Result<(Option<NonZeroU32>, usize), SegmentsError> {
-
-        let dst_id = start;
-
-        let (cutoff_freq, n_merge) = self.estimate_merge_cutoff(start, curr_vtime)?; 
-
-        let mut req_rate_accu = 0.0;
-        let mut write_rate_accu = 0.0;
-        let mut miss_ratio_accu = 0.0; 
-        let mut create_at = 0;
-
-        // prune and compact target segment
-        {
-            let mut dst = self.get_mut(start)?;
-            let _n_bytes = dst.compact(hashtable, cutoff_freq, curr_vtime, remove_item_active_flag, ghost_map)?;
-            dst.header.can_evict_this_round = can_evict_this_round;
-            dst.mark_merged();
-
-            req_rate_accu += dst.header.req_rate;
-            write_rate_accu += dst.header.write_rate;
-            miss_ratio_accu += dst.header.miss_ratio;
-            create_at += dst.header.create_at().as_secs();
-
-            // TODO: 
-            // move evicted object to ghosts 
-            // add size bucket support 
-            // add large object support 
-            // w68 1GB 
-            // more frequent training 
-        }
-
-        let mut src_id = self.headers[start.get() as usize - 1].next_seg().unwrap();
-        for idx in 1..n_merge {
-            let next_src_id = self.headers[src_id.get() as usize - 1].next_seg().unwrap(); 
-            let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
-            assert_eq!(dst.ttl(), src.ttl());
-            assert!(dst.create_at() <= src.create_at()); 
-
-            let src_live_items = src.live_items();
-            let src_live_bytes = src.live_bytes();
-            let dst_start_size = dst.live_bytes();
-            let dst_start_item = dst.live_items();
-            let _n_bytes = src.copy_into(&mut dst, hashtable, cutoff_freq, curr_vtime, remove_item_active_flag, ghost_map).unwrap();
-
-            req_rate_accu += src.header.req_rate;
-            write_rate_accu += src.header.write_rate;
-            miss_ratio_accu += src.header.miss_ratio;
-            create_at += src.header.create_at().as_secs();
-
-            trace!(
-                "{} src {} ({} byte {} item) -> dst {}: {} bytes -> {} bytes, {} object -> {} object, cutoff {}",
-                idx, src_id, src_live_bytes, src_live_items, 
-                dst_id,
-                dst_start_size, dst.live_bytes(), 
-                dst_start_item, dst.live_items(), 
-                cutoff_freq
-            );
-
-            src.clear(hashtable, false);
-            src.header.can_evict_this_round = can_evict_this_round;
-            self.push_free(src_id, Some(ttl_bucket));
-            src_id = next_src_id; 
-        }
-        
-        let next_id = self.headers[src_id.get() as usize - 1].next_seg();
-        
-        let segment_size = self.segment_size();
-        let n_free = self.n_free(); 
-        let mut dst = self.get_mut(dst_id).unwrap();
-
-        dst.header.req_rate = req_rate_accu / n_merge as f32;
-        dst.header.write_rate = write_rate_accu / n_merge as f32;
-        dst.header.miss_ratio = miss_ratio_accu / n_merge as f32;
-        dst.header.create_at = CoarseInstant::from_secs(create_at / n_merge as u32);
-        dst.header.n_req = 0;
-        dst.header.n_active = 0; 
-        dst.header.snapshot_time = -1;
-        dst.header.train_data_idx = -1;
-
-        // println!("dst bytes {} cutoff {}", dst.live_bytes(), cutoff_freq);
-        // if the destination is almost empty, let's clear it 
-        // if dst.live_bytes() < segment_size / 2 { 
-        if dst.live_bytes() == 0 { 
-            if dst.live_bytes() != 0 {
-                println!(
-                    "current time {}, merged {} segments, free, {}, return merged segment dst {}: {}/{} bytes {:?}",
-                    CoarseInstant::now().as_secs(), 
-                    n_merge, n_free, dst_id,
-                    dst.live_bytes(),
-                    segment_size, dst,
-                );
-            }
-            dst.clear(hashtable, false); 
-            self.push_free(dst_id, Some(ttl_bucket));
-            // panic!(""); 
-        } 
-        // println!("************************** {}", self.evict.n_merge()); 
-
-        Ok((next_id, n_merge))
-    }
-
-    /// each time pick one segment, retain 1/n_merge bytes, insert to the tail of the chain 
-    pub fn merge_reinsert (
-        &mut self,
-        start: NonZeroU32,
-        hashtable: &mut HashTable,
-        ttl_bucket: &mut TtlBucket,
-        curr_vtime: u64, 
-        can_evict_this_round: bool, 
-        remove_item_active_flag: bool, 
-        ghost_map: &mut HashMap<u64, u64>, 
-    ) -> Result<(), SegmentsError> {
-
-        let retain_size = self.segment_size() / self.evict.n_merge() as i32; 
-        let cutoff_freq = self.estimate_cutoff_one_seg(start, curr_vtime, retain_size)?;
-        // let cutoff_freq = f64::MAX;
-
-        // prune and compact target segment
-        {
-            let mut dst = self.get_mut(start)?;
-            let _n_bytes = dst.compact(hashtable, cutoff_freq, curr_vtime, remove_item_active_flag, ghost_map)?;
-            dst.header.can_evict_this_round = can_evict_this_round;
-            dst.header.reset_header_cache_stat = true; 
-            
-            dst.header.create_at = CoarseInstant::recent();
-            dst.header.n_req = 0;
-            dst.header.n_active = 0; 
-            dst.header.snapshot_time = -1;
-            dst.header.train_data_idx = -1;
-        }
-
-        self.unlink_segment(start, Some(ttl_bucket));
-
-        let mut dst = self.get_mut(start)?;
-        dst.set_prev_seg(ttl_bucket.tail);
-        dst.set_next_seg(None);
-        ttl_bucket.tail = Some(start);
-
-        // println!("********************* new seg {:?}", dst.header);
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn prepare_merge_into_seg(
-        &mut self, 
-        seg_id: NonZeroU32, 
-        hashtable: &mut HashTable,
-        _ttl_bucket: &mut TtlBucket,
-        curr_vtime: u64, 
-        ghost_map: &mut HashMap<u64, u64>, 
-    ) -> Result<(), SegmentsError> {
-
-        let mut dst = self.get_mut(seg_id)?;
-        let dst_old_size = dst.live_bytes();
-
-        dst.compact(hashtable, 0.0, curr_vtime, false, ghost_map)?;
-
-        let dst_new_size = dst.live_bytes();
-        trace!(
-            "dst {}: {} bytes -> {} bytes",
-            seg_id,
-            dst_old_size,
-            dst_new_size
-        );
-
-        dst.mark_merged();
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn merge_compact(
-        &mut self,
-        start: NonZeroU32,
-        hashtable: &mut HashTable,
-        ttl_bucket: &mut TtlBucket,
-        curr_vtime: u64,
-        ghost_map: &mut HashMap<u64, u64>,
-    ) -> Result<(), SegmentsError> {
-            
-        let mut dst_id = start;
-        let chain_len = self.evict.n_compact(); 
-
-        // println!("merge compact ttl {}, {} segs starting from {}", ttl_bucket.ttl(), chain_len, start.get());
-
-        let mut dst = self.get_mut(start)?;
-        dst.compact(hashtable, 0.0, curr_vtime, false, ghost_map)?;
-        dst.mark_merged();
-        let mut src_id = self.headers[start.get() as usize - 1].next_seg().unwrap();
-
-        for _ in 0..chain_len - 1 {
-            // compact dst 
-            self.prepare_merge_into_seg(dst_id, hashtable, ttl_bucket, curr_vtime, ghost_map)?;
-            // merge into src id 
-
-            // next src (this must be non-zero because we do not merge the last segment) 
-            let next_src_id = self.headers[src_id.get() as usize - 1].next_seg().unwrap();
-
-            // println!("** merge compact {} -> {} {} {}", src_id.get(), dst_id.get(), self.headers[src_id.get() as usize - 1].not_evictable_reason(), self.headers[dst_id.get() as usize - 1].not_evictable_reason());
-
-            let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
-
-            // let dst_start_size = dst.live_bytes();
-            // let src_start_size = src.live_bytes();
-
-            let _ = src.copy_into(&mut dst, hashtable, 0.0, curr_vtime, false, ghost_map);
-
-            // let dst_new_size = dst.live_bytes();
-            // let src_new_size = src.live_bytes();
-            // println!("**** dst size {} -> {}, src size {} -> {}", dst_start_size, dst_new_size, src_start_size, src_new_size);
-
-            let n_src_live_bytes = src.live_bytes(); 
-            if n_src_live_bytes > 0 {
-                // src becomes the new dst 
-                src.compact(hashtable, 0.0, curr_vtime, false, ghost_map)?;
-                src.mark_merged();
-                dst_id = src_id;
-            } else {
-                src.set_accessible(false);
-                src.set_evictable(false);
-                self.push_free(src_id, Some(ttl_bucket));
-            }
-
-            src_id = next_src_id; 
-        }
-
-
-        Ok(())
-    }
-
-
-
-
-
-
-
     #[allow(dead_code)]
     pub fn verify_segments_status(&self, msg: &str) {
         let mut n_free = 0;
@@ -1558,9 +1018,6 @@ impl Segments {
             }
 
             let item_size = item.size();
-            // n_item += 1;
-            // println!("item {:4} @ {:8}: {:6} B, freq {}, access_age {}, create age {}, active {}", n_item, offset, 
-            //             item.size(), item.get_freq(), item.get_last_access_age(), item.get_create_age(), item.has_accessed_since_write());
             offset += item_size;
         }
     }

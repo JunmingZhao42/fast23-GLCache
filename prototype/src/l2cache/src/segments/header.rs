@@ -64,13 +64,7 @@ pub struct SegmentHeader {
     pub(crate) snapshot_time: i32,
     pub(crate) train_data_idx: i32,
 
-    pub(crate) req_rate: f32, 
-    pub(crate) write_rate: f32, 
-    pub(crate) miss_ratio: f32,
-
-    pub(crate) n_req: u32, 
     pub(crate) n_active: u32,
-    pub(crate) n_merge: u16,
     // used for learned eviction with reinsertion 
     pub(crate) reset_header_cache_stat: bool, 
 
@@ -104,12 +98,7 @@ impl SegmentHeader {
             train_data_idx: -1,
             pred_utility: 0.0,
 
-            req_rate: 0.0,
-            write_rate: 0.0,
-            miss_ratio: 0.0,
-            n_req: 0,
             n_active: 0,
-            n_merge: 0,
             reset_header_cache_stat: false,
 
             accessible: false,
@@ -137,12 +126,7 @@ impl SegmentHeader {
         self.snapshot_time = -1;
         self.train_data_idx = -1;
         self.pred_utility = 0.0;
-        self.req_rate = 0.0;
-        self.write_rate = 0.0;
-        self.miss_ratio = 0.0;
-        self.n_req = 0;
         self.n_active = 0;
-        self.n_merge = 0;
         
         self.reset_header_cache_stat = false;
         
@@ -321,15 +305,6 @@ impl SegmentHeader {
     /// Returns the instant at which the segment was merged
     pub fn merge_at(&self) -> CoarseInstant {
         self.merge_at
-    }
-
-    #[inline]
-    /// Update the created time
-    pub fn mark_merged(&mut self) {
-        self.merge_at = CoarseInstant::recent();
-        if self.n_merge < u16::MAX {
-            self.n_merge += 1;
-        }
     }
 
     #[inline]

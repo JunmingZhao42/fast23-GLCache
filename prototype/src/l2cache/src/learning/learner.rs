@@ -11,7 +11,7 @@ use crate::*;
 use std::time::Instant;
 
 const N_TRAINING_SAMPLES: usize = 8192 * 2;
-const N_FEATURES: usize = 10; 
+const N_FEATURES: usize = 3; 
 
 
 pub struct L2Learner {
@@ -48,16 +48,16 @@ fn gen_x_from_header(header: &SegmentHeader, base_x: &mut [f64], idx: usize) {
     let end_idx = start_idx + N_FEATURES;
     let x: &mut [f64] = &mut base_x[start_idx..end_idx];
 
-    x[0] = header.req_rate as f64;
-    x[1] = header.write_rate as f64;
-    x[2] = header.miss_ratio as f64;
-    x[3] = header.live_items as f64;
-    x[4] = header.live_bytes as f64;
-    x[5] = (CoarseInstant::recent().as_secs() - header.create_at().as_secs()) as f64;
-    x[6] = ((header.create_at().as_secs() / 3600) % 24) as f64;
-    x[7] = header.n_merge as f64;
-    x[8] = header.n_req as f64;
-    x[9] = header.n_active as f64;
+    // x[0] = header.req_rate as f64;
+    // x[1] = header.write_rate as f64;
+    // x[0] = header.miss_ratio as f64;
+    x[0] = header.live_items as f64;
+    x[1] = header.live_bytes as f64;
+    // x[3] = (CoarseInstant::recent().as_secs() - header.create_at().as_secs()) as f64;
+    // x[5] = ((header.create_at().as_secs() / 3600) % 24) as f64;
+    // x[7] = header.n_merge as f64;
+    // x[8] = header.n_req as f64;
+    x[2] = header.n_active as f64;
 }
 
 
@@ -176,6 +176,11 @@ impl L2Learner {
         let inputs = Matrix::new(self.n_curr_train_samples, N_FEATURES, &self.train_x[..self.n_curr_train_samples*N_FEATURES]);
         let targets = Vector::new(&self.train_y[..self.n_curr_train_samples]);    
     
+        // for idx in 0..self.n_curr_train_samples {
+        //     println!("Train{:?}", &self.train_x[idx * N_FEATURES .. (idx+1) * N_FEATURES]);
+        //     println!("{}", self.train_y[idx]);
+        // }
+
         let _ = self.model.train(&inputs, &targets);
 
         let elapsed = start_time.elapsed().as_micros();

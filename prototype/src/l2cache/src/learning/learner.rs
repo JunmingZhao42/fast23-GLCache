@@ -7,7 +7,7 @@ use log::{info, warn};
 use std::time::Instant;
 
 const N_TRAINING_SAMPLES: usize = 8192 * 2;
-const N_FEATURES: usize = 10; 
+const N_FEATURES: usize = 3; 
 const N_TRAIN_ITER: u32 = 8;
 
 // const APPROX_AGE_SHIFT: usize = 2;
@@ -48,29 +48,16 @@ fn gen_x_from_header(header: &SegmentHeader, base_x: &mut [f32], idx: usize) {
     let end_idx = start_idx + N_FEATURES;
     let x: &mut [f32] = &mut base_x[start_idx..end_idx];
 
-    x[0] = header.req_rate;
-    x[1] = header.write_rate;
-    x[2] = header.miss_ratio;
-    x[3] = header.live_items as f32;
-    x[4] = header.live_bytes as f32;
-    x[5] = (CoarseInstant::recent().as_secs() - header.create_at().as_secs()) as f32;
-    x[6] = ((header.create_at().as_secs() / 3600) % 24) as f32;
-    x[7] = header.n_merge as f32;
-    x[8] = header.n_req as f32;
-    x[9] = header.n_active as f32;
-
-    // x[0] = quickrandom() as f32;
-    // for i in 1..10 {
-    //     x[i] = 0.0; 
-    // }
-
-    // if header.n_merge > 0 {
-    //     x[9] = header.n_req as f32 / (CoarseInstant::recent().as_secs() - header.merge_at().as_secs() + 1) as f32;
-    //     x[10]= header.n_active as f32 / (CoarseInstant::recent().as_secs() - header.merge_at().as_secs() + 1) as f32;
-    // } else {
-    //     x[9] = header.n_req as f32 / (CoarseInstant::recent().as_secs() - header.create_at().as_secs() + 1) as f32;
-    //     x[10]= header.n_active as f32 / (CoarseInstant::recent().as_secs() - header.create_at().as_secs() + 1) as f32;
-    // }
+    // x[0] = header.req_rate as f64;
+    // x[1] = header.write_rate as f64;
+    // x[0] = header.miss_ratio as f64;
+    x[0] = header.live_items as f32;
+    x[1] = header.live_bytes as f32;
+    // x[3] = (CoarseInstant::recent().as_secs() - header.create_at().as_secs()) as f64;
+    // x[5] = ((header.create_at().as_secs() / 3600) % 24) as f64;
+    // x[7] = header.n_merge as f64;
+    // x[8] = header.n_req as f64;
+    x[2] = header.n_active as f32;
 }
 
 

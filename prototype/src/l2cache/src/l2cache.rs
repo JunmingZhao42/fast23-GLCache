@@ -173,7 +173,6 @@ impl L2Cache {
                     }    
                 }
 
-                seg_header.n_req += 1;
                 if ! item.raw.has_accessed_since_write() {
                     seg_header.n_active += 1;
                     assert!(seg_header.n_active <= seg_header.live_items() as u32);
@@ -227,25 +226,6 @@ impl L2Cache {
                 Ok((reserved_item, update_bucket_linking)) => {
                     if update_bucket_linking {
                         self.ttl_buckets.fix_bucket_linking();
-                    }
-
-                    if reserved_item.offset() == 0 || reserved_item.offset() == std::mem::size_of_val(&SEG_MAGIC) {
-                        let mut seg = &mut self.segments.headers[reserved_item.seg().get() as usize - 1]; 
-                        seg.write_rate = self.write_rate;
-                        seg.req_rate = self.req_rate;
-                        seg.miss_ratio = self.miss_ratio;
-                    }
-
-                    {
-                        // // for learned-reinsertion 
-                        // let mut seg = &mut self.segments.headers[reserved_item.seg().get() as usize - 1]; 
-                        // if seg.reset_header_cache_stat {
-                        //     // println!("reset {:?}", seg);
-                        //     seg.reset_header_cache_stat = false; 
-                        //     seg.write_rate = self.write_rate;
-                        //     seg.req_rate = self.req_rate;
-                        //     seg.miss_ratio = self.miss_ratio;
-                        // }
                     }
 
                     return Ok(reserved_item);

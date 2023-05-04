@@ -223,12 +223,6 @@ impl<'a> Segment<'a> {
         self.header.create_at()
     }
 
-    /// Mark that the segment has been merged
-    #[inline]
-    pub fn mark_merged(&mut self) {
-        self.header.mark_merged()
-    }
-
     #[inline]
     #[allow(dead_code)]
     pub fn mark_created(&mut self) {
@@ -428,118 +422,6 @@ impl<'a> Segment<'a> {
         RawItem::from_ptr(unsafe { self.data.as_mut_ptr().add(offset) })
     }
 
-    /// This is used as part of segment merging, it moves all occupied space to
-    /// the beginning of the segment, leaving the end of the segment free
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn compact(
-        &mut self,
-        hashtable: &mut HashTable,
-        cutoff_freq: f64,
-        curr_vtime: u64,
-        remove_item_active_flag: bool,
-        ghost_map: &mut HashMap<u64, u64>,
-    ) -> Result<i32, SegmentsError> {
-        let max_offset = self.max_item_offset();
-        let mut read_offset = if cfg!(feature = "magic") {
-            std::mem::size_of_val(&SEG_MAGIC)
-        } else {
-            0
-        };
-
-        let mut write_offset = read_offset;
-        let mut n_evicted_bytes = 0;
-
-        // println!("segment {:?}", self.header);
-        while read_offset <= max_offset {
-            let mut item = self.get_item_at(read_offset);
-            if item.klen() == 0 && self.live_items() == 0 {
-                break;
-            }
-            item.check_magic();
-
-            let item_size = item.size();
-
-            // skip deleted items and ones that won't fit in the target segment
-            if item.is_deleted() {
-                read_offset += item_size;
-                continue;
-            }
-
-            let item_score = item.get_score(curr_vtime);
-
-            if self.header.train_data_idx != -1 && !item.has_accessed_since_snapshot() {
-                // cconstruct ghost entry
-                let key_u64 = item.key_as_u64();
-                let ghost_entry = (self.header.train_data_idx as u64) << 32 | (item_size as u64);
-                ghost_map.insert(key_u64, ghost_entry);
-            }
-
-            if cutoff_freq > 0.0 && item_score <= cutoff_freq {
-                n_evicted_bytes += item_size;
-                if !hashtable.evict(item.key(), read_offset.try_into().unwrap(), self) {
-                    warn!("unlinked item was present in segment");
-                    self.remove_item_at(read_offset, true);
-                }
-
-                read_offset += item_size;
-                continue;
-            }
-
-            let freq_to_set = ((item.get_freq() as u32 + 1) / 2) as u8;
-
-            if read_offset != write_offset {
-                let src = unsafe { self.data.as_ptr().add(read_offset) };
-                let dst = unsafe { self.data.as_mut_ptr().add(write_offset) };
-
-                if hashtable
-                    .relink_item(
-                        item.key(),
-                        self.id(),
-                        self.id(),
-                        read_offset as u64,
-                        write_offset as u64,
-                    )
-                    .is_ok()
-                {
-                    // if an item has been accessed, it will be at least one
-                    // note that we use a copy that can handle overlap
-                    unsafe {
-                        // std::ptr::copy(src, dst, item_size);
-                        std::ptr::copy(src, dst, ITEM_HDR_SIZE + item.klen() as usize);
-                    }
-
-                    let mut new_item = self.get_item_at(write_offset);
-                    new_item.set_freq(freq_to_set);
-                    if remove_item_active_flag {
-                        new_item.set_accessed_since_write(false);
-                        new_item.set_accessed_since_snapshot(false);
-                    }
-
-                    assert_eq!(new_item.size(), item_size);
-                } else {
-                    // this shouldn't happen, but if relink does fail we can
-                    // only move forward or return an error
-                    println!("object {} {:?}", item.key_as_u64(), item.header());
-                    panic!("{:?}", self.header);
-                    // read_offset += item_size;
-                    // write_offset = read_offset;
-                    // continue;
-                }
-            } else {
-                item.set_freq(freq_to_set);
-            }
-
-            read_offset += item_size;
-            write_offset += item_size;
-            continue;
-        }
-
-        // updates the write offset to the new position
-        self.set_write_offset(write_offset as i32);
-
-        Ok(n_evicted_bytes as i32)
-    }
-
     /// This is used to copy data from this segment into the target segment and
     /// relink the items in the hashtable
     ///
@@ -549,6 +431,7 @@ impl<'a> Segment<'a> {
     /// is left to the caller to decide how to handle this
     ///
     ///
+    #[allow(dead_code)]
     pub(crate) fn copy_into(
         &mut self,
         target: &mut Segment,

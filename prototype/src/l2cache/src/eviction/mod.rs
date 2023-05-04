@@ -231,6 +231,7 @@ impl Eviction {
     }
 
     #[inline]
+    #[allow(dead_code)]
     /// Returns the maximum number of segments which can be merged during a
     /// single merge operation. Applies to both eviction and compaction merge
     /// passes.

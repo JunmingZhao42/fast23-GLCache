@@ -13,6 +13,7 @@ pub enum SegmentsError {
     // #[error("item relink failure")]
     // RelinkFailure,
     #[error("evictable segment chain too short")]
+    #[allow(dead_code)]
     EvictableSegmentChainTooShort,
     #[error("no evictable segments")]
     NoEvictableSegments,

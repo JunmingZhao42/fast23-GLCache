@@ -29,7 +29,6 @@
 
 // item constants
 use rustcommon_time::CoarseInstant;
-use crate::*; 
 
 /// The size of the item header in bytes
 pub const ITEM_HDR_SIZE: usize = std::mem::size_of::<crate::item::ItemHeader>();
@@ -294,13 +293,13 @@ impl ItemHeader {
             // self.freq += 1;
         // } 
 
-        if self.freq < 8 {
-            self.freq += 1;
-        } else {
-            if self.freq < u8::MAX && quickrandom() % (self.freq as u64) < 2 {
-                self.freq += 1;
-            }
-        }
+        // if self.freq < 8 {
+        //     self.freq += 1;
+        // } else {
+        //     if self.freq < u8::MAX && quickrandom() % (self.freq as u64) < 2 {
+        //         self.freq += 1;
+        //     }
+        // }
 
 
         self.set_accessed_since_write(true); 

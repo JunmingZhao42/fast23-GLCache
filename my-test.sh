@@ -1,4 +1,4 @@
-TRACE_DIR=/mnt/disk2/junming/glcache
+TRACE_DIR=/mnt/disk2/junming/glcache/msr
 TRACE=prn_1.IQI.bin.oracleGeneral
 CACHE=segcache
 

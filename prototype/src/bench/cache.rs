@@ -42,9 +42,9 @@ pub fn create_cache(args: &Box<Args>) -> Cache {
                     compact: 0,
                 });
 
-            if args.datapool_path.len() > 0 {
-                cb = cb.datapool_path(Some(args.datapool_path.clone()));
-            }
+            // if args.datapool_path.len() > 0 {
+            //     cb = cb.datapool_path(Some(args.datapool_path.clone()));
+            // }
 
             let cache = cb.build();
 
@@ -86,9 +86,9 @@ pub fn create_cache(args: &Box<Args>) -> Cache {
                 });
             }
 
-            if args.datapool_path.len() > 0 {
-                cb = cb.datapool_path(Some(args.datapool_path.clone()));
-            }
+            // if args.datapool_path.len() > 0 {
+            //     cb = cb.datapool_path(Some(args.datapool_path.clone()));
+            // }
 
             let cache = cb.build();
 

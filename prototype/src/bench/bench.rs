@@ -87,9 +87,9 @@ impl Bench {
     }
 
     pub fn run(&mut self) {
-        let mut get_time = 0;
-        let mut set_time = 0;
-        let mut get_miss_time = 0;
+        // let mut get_time = 0;
+        // let mut set_time = 0;
+        // let mut get_miss_time = 0;
 
         self.start_time = std::time::Instant::now();
         let mut request: Request = Request::default(); 
@@ -125,25 +125,25 @@ impl Bench {
                 Ok(()) => {
                     match request.op {
                         Op::Get => {
-                            let mut now = std::time::Instant::now();
+                            // let mut now = std::time::Instant::now();
                             let ret = self.cache.get(&request, &mut buf);
                             if !ret {
-                                get_miss_time += now.elapsed().as_micros();
-                                now = std::time::Instant::now();
+                                // get_miss_time += now.elapsed().as_micros();
+                                // now = std::time::Instant::now();
                                 self.n_get_miss_interval += 1;
                                 self.n_set_interval += 1;
                                 self.cache.set(&request);
-                                set_time += now.elapsed().as_micros();
+                                // set_time += now.elapsed().as_micros();
                             } else {
-                                get_time += now.elapsed().as_micros();
+                                // get_time += now.elapsed().as_micros();
                                 self.n_get_interval += 1;
                             }
                         }
                         Op::Set => {
-                            let now = std::time::Instant::now();
+                            // let now = std::time::Instant::now();
                             self.n_set_interval += 1;
                             self.cache.set(&request); 
-                            set_time += now.elapsed().as_micros();
+                            // set_time += now.elapsed().as_micros();
                         }
                         Op::Del => {
                             self.n_del_interval += 1;
@@ -184,7 +184,7 @@ impl Bench {
             }
         }
 
-        info!("GET {} us, SET {} us, GET MISS {} us", get_time, set_time, get_miss_time);
+        // info!("GET {} us, SET {} us, GET MISS {} us", get_time, set_time, get_miss_time);
         self.trace_time = request.real_time as i32 - trace_start;
         self.end_time = std::time::Instant::now();
     }
